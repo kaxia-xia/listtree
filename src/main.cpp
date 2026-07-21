@@ -612,52 +612,59 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                             std::string dirpath = node.path.string();
                             tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
-                            status_msg = fmt::format("在窗格 {} 中 cd 到目录: {}", cd_pane_id, node.display_name);
-                        } else {
-                            // 切换展开/折叠（仅当没有 cd 窗格时）
-                            bool was_expanded = node.expanded;
-                            node.expanded = !was_expanded;
+                        }
 
-                            if (node.expanded) {
-                                // 展开：插入子节点
-                                std::vector<fs::directory_entry> entries;
-                                try {
-                                    for (auto &entry : fs::directory_iterator(node.path)) {
-                                        if (!show_hidden && is_hidden(entry.path())) continue;
-                                        entries.push_back(entry);
-                                    }
-                                } catch (const fs::filesystem_error &) {}
+                        // 无论是否指定 cd 窗格，文件树都要展开/折叠
+                        bool was_expanded = node.expanded;
+                        node.expanded = !was_expanded;
 
-                                std::sort(entries.begin(), entries.end(),
-                                          [](const fs::directory_entry &a, const fs::directory_entry &b) {
-                                              bool a_is_dir = a.is_directory();
-                                              bool b_is_dir = b.is_directory();
-                                              if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
-                                              return a.path().filename().string() < b.path().filename().string();
-                                          });
-
-                                std::vector<TreeNode> children;
-                                for (auto &entry : entries) {
-                                    children.emplace_back(entry, node.depth + 1);
+                        if (node.expanded) {
+                            // 展开：插入子节点
+                            std::vector<fs::directory_entry> entries;
+                            try {
+                                for (auto &entry : fs::directory_iterator(node.path)) {
+                                    if (!show_hidden && is_hidden(entry.path())) continue;
+                                    entries.push_back(entry);
                                 }
+                            } catch (const fs::filesystem_error &) {}
 
-                                // 在当前节点后面插入子节点
-                                all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
-                                                 children.begin(), children.end());
+                            std::sort(entries.begin(), entries.end(),
+                                      [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                          bool a_is_dir = a.is_directory();
+                                          bool b_is_dir = b.is_directory();
+                                          if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                          return a.path().filename().string() < b.path().filename().string();
+                                      });
 
-                                status_msg = fmt::format("展开目录: {}", node.display_name);
+                            std::vector<TreeNode> children;
+                            for (auto &entry : entries) {
+                                children.emplace_back(entry, node.depth + 1);
+                            }
+
+                            // 在当前节点后面插入子节点
+                            all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
+                                             children.begin(), children.end());
+
+                            if (!cd_pane_id.empty()) {
+                                status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
                             } else {
-                                // 折叠：移除子节点
-                                int remove_count = 0;
-                                int start_remove = cursor_pos + 1;
-                                for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
-                                    if (all_nodes[i].depth <= node.depth) break;
-                                    remove_count++;
-                                }
-                                if (remove_count > 0) {
-                                    all_nodes.erase(all_nodes.begin() + start_remove,
-                                                    all_nodes.begin() + start_remove + remove_count);
-                                }
+                                status_msg = fmt::format("展开目录: {}", node.display_name);
+                            }
+                        } else {
+                            // 折叠：移除子节点
+                            int remove_count = 0;
+                            int start_remove = cursor_pos + 1;
+                            for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
+                                if (all_nodes[i].depth <= node.depth) break;
+                                remove_count++;
+                            }
+                            if (remove_count > 0) {
+                                all_nodes.erase(all_nodes.begin() + start_remove,
+                                                all_nodes.begin() + start_remove + remove_count);
+                            }
+                            if (!cd_pane_id.empty()) {
+                                status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                            } else {
                                 status_msg = fmt::format("折叠目录: {}", node.display_name);
                             }
                         }
@@ -1009,7 +1016,7 @@ int main(int argc, char *argv[]) {
             fmt::print("  -h, --help         显示此帮助信息\n\n");
             fmt::print(style::title_color, "交互模式操作:\n");
             fmt::print("  ↑/↓        移动光标\n");
-            fmt::print("  Space      目录:展开/折叠一级（若指定 -c 则改为在 cd 窗格中 cd 到该目录）\n");
+            fmt::print("  Space      目录:展开/折叠（若指定 -c 则同时在 cd 窗格中 cd 到该目录）\n");
             fmt::print("             文件:在 tmux 窗格中打开（若窗格正在运行程序则先中断）\n");
             fmt::print("  q/ESC      退出交互模式\n\n");
             fmt::print(style::title_color, "示例:\n");
