@@ -548,13 +548,22 @@ void tmux_smart_interrupt(const std::vector<std::string> &pane_ids) {
 std::string handle_space_action(TreeNode &node, const std::vector<std::string> &pane_ids,
                                 const std::vector<std::string> &cd_pane_ids) {
     if (node.is_dir) {
-        // 如果指定了 cd 窗格，智能中断后 cd 到该目录
+        // 如果指定了 cd 窗格，且窗格空闲（没有运行程序），则 cd 到该目录
         if (!cd_pane_ids.empty()) {
-            tmux_smart_interrupt(cd_pane_ids);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            std::string dirpath = node.path.string();
-            tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", dirpath));
-            return fmt::format("在窗格中 cd 到目录: {}", node.display_name);
+            if (!tmux_pane_is_busy(cd_pane_ids)) {
+                std::string dirpath = node.path.string();
+                tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", dirpath));
+                return fmt::format("在窗格中 cd 到目录: {}", node.display_name);
+            } else {
+                // 窗格正在运行程序，跳过 cd
+                // 但仍然要展开/折叠目录
+                node.expanded = !node.expanded;
+                if (node.expanded) {
+                    return fmt::format("展开目录（窗格忙，跳过 cd）: {}", node.display_name);
+                } else {
+                    return fmt::format("折叠目录（窗格忙，跳过 cd）: {}", node.display_name);
+                }
+            }
         }
         // 切换展开/折叠
         node.expanded = !node.expanded;
@@ -570,7 +579,7 @@ std::string handle_space_action(TreeNode &node, const std::vector<std::string> &
         std::string filepath = node.path.string();
 
         if (is_document_file(node.path)) {
-            // 文档文件 - 用 micro 打开
+            // 文档文件 - 用 micro 打开（始终中断正在运行的程序）
             if (!pane_ids.empty()) {
                 tmux_smart_interrupt(pane_ids);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -580,7 +589,7 @@ std::string handle_space_action(TreeNode &node, const std::vector<std::string> &
                 return fmt::format("未指定 tmux 窗格，无法打开文件: {}", node.display_name);
             }
         } else if (is_archive_file(node.path)) {
-            // 压缩包 - 显示内容
+            // 压缩包 - 显示内容（始终中断正在运行的程序）
             if (!pane_ids.empty()) {
                 tmux_smart_interrupt(pane_ids);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -601,7 +610,7 @@ std::string handle_space_action(TreeNode &node, const std::vector<std::string> &
                 return fmt::format("未指定 tmux 窗格，无法显示压缩包: {}", node.display_name);
             }
         } else if (node.is_exec) {
-            // 可执行文件 - 直接执行
+            // 可执行文件 - 直接执行（始终中断正在运行的程序）
             if (!pane_ids.empty()) {
                 tmux_smart_interrupt(pane_ids);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -878,10 +887,8 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                         auto &node = all_nodes[cursor_pos];
 
                         if (node.is_dir) {
-                            // 如果指定了 cd 窗格，智能中断后 cd 到该目录
-                            if (!cd_pane_ids.empty()) {
-                                tmux_smart_interrupt(cd_pane_ids);
-                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            // 如果指定了 cd 窗格且窗格空闲，则 cd 到该目录
+                            if (!cd_pane_ids.empty() && !tmux_pane_is_busy(cd_pane_ids)) {
                                 std::string dirpath = node.path.string();
                                 tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", dirpath));
                             }
@@ -918,7 +925,11 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                                                  children.begin(), children.end());
 
                                 if (!cd_pane_ids.empty()) {
-                                    status_msg = fmt::format("展开 + cd 到目录: {}", node.display_name);
+                                    if (tmux_pane_is_busy(cd_pane_ids)) {
+                                        status_msg = fmt::format("展开（窗格忙，跳过 cd）: {}", node.display_name);
+                                    } else {
+                                        status_msg = fmt::format("展开 + cd 到目录: {}", node.display_name);
+                                    }
                                 } else {
                                     status_msg = fmt::format("展开目录: {}", node.display_name);
                                 }
@@ -935,7 +946,11 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                                                     all_nodes.begin() + start_remove + remove_count);
                                 }
                                 if (!cd_pane_ids.empty()) {
-                                    status_msg = fmt::format("折叠 + cd 到目录: {}", node.display_name);
+                                    if (tmux_pane_is_busy(cd_pane_ids)) {
+                                        status_msg = fmt::format("折叠（窗格忙，跳过 cd）: {}", node.display_name);
+                                    } else {
+                                        status_msg = fmt::format("折叠 + cd 到目录: {}", node.display_name);
+                                    }
                                 } else {
                                     status_msg = fmt::format("折叠目录: {}", node.display_name);
                                 }
@@ -1075,10 +1090,12 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                 case Key::CDROOT: {
                     // cd 到最上层目录（根目录）
                     if (!cd_pane_ids.empty()) {
-                        tmux_smart_interrupt(cd_pane_ids);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                        tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", root_path.string()));
-                        status_msg = fmt::format("📂 已 cd 到根目录: {}", root_path.filename().string());
+                        if (!tmux_pane_is_busy(cd_pane_ids)) {
+                            tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", root_path.string()));
+                            status_msg = fmt::format("📂 已 cd 到根目录: {}", root_path.filename().string());
+                        } else {
+                            status_msg = "⚠️ cd 窗格正在运行程序，跳过";
+                        }
                     } else {
                         status_msg = "❌ 未指定 cd 窗格 (-c)";
                     }
