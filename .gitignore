@@ -1,0 +1,27 @@
+# === 编译产物 ===
+listtree
+*.o
+*.obj
+*.exe
+*.out
+
+# === CMake ===
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# === 编辑器/IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === 编译数据库 ===
+compile_commands.json
