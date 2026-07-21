@@ -265,6 +265,13 @@ enum class Key {
 std::string read_line_input() {
     std::string result;
     char c;
+    // 临时改为阻塞模式
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &raw);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
     while (true) {
         if (read(STDIN_FILENO, &c, 1) != 1) break;
         if (c == '\n' || c == '\r') break;
@@ -283,6 +290,16 @@ std::string read_line_input() {
             fflush(stdout);
         }
     }
+
+    // 恢复非阻塞模式
+    {
+        struct termios restore;
+        tcgetattr(STDIN_FILENO, &restore);
+        restore.c_cc[VMIN] = 0;
+        restore.c_cc[VTIME] = 1;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &restore);
+    }
+
     return result;
 }
 
@@ -1097,8 +1114,15 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                         fmt::print(style::error_color, "  ⚠️ 确认删除 \"{}\"？(y/n): ", target_name);
                         fflush(stdout);
 
-                        // 读取确认
+                        // 读取确认（临时切换到阻塞模式，等待用户输入）
                         char confirm = 0;
+                        // 从当前原始模式临时改为 VMIN=1, VTIME=0（阻塞读一个字符）
+                        struct termios raw;
+                        tcgetattr(STDIN_FILENO, &raw);
+                        raw.c_cc[VMIN] = 1;
+                        raw.c_cc[VTIME] = 0;
+                        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+
                         if (read(STDIN_FILENO, &confirm, 1) == 1) {
                             if (confirm == 'y' || confirm == 'Y') {
                                 std::error_code ec;
@@ -1127,6 +1151,15 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                             } else {
                                 status_msg = fmt::format("已取消删除: {}", target_name);
                             }
+                        }
+
+                        // 恢复原始终端模式（VMIN=0, VTIME=1 非阻塞）
+                        {
+                            struct termios restore;
+                            tcgetattr(STDIN_FILENO, &restore);
+                            restore.c_cc[VMIN] = 0;
+                            restore.c_cc[VTIME] = 1;
+                            tcsetattr(STDIN_FILENO, TCSAFLUSH, &restore);
                         }
                     } else {
                         status_msg = "❌ 没有选中任何项目";
