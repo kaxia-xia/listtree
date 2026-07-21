@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -247,14 +248,41 @@ void disable_raw_mode() {
 }
 
 //============================================================================
-// 读取按键（支持方向键等转义序列）
+// 读取按键（支持方向键等转义序列 + 输入模式）
 //============================================================================
 
 enum class Key {
     UP, DOWN, LEFT, RIGHT,
     SPACE, ENTER, ESC, Q,
+    MKDIR,      // m 键：创建目录
+    NEWFILE,    // n 键：创建文件
     UNKNOWN
 };
+
+// 读取一行输入（在原始模式下，读取直到 Enter）
+std::string read_line_input() {
+    std::string result;
+    char c;
+    while (true) {
+        if (read(STDIN_FILENO, &c, 1) != 1) break;
+        if (c == '\n' || c == '\r') break;
+        if (c == 127 || c == '\b') { // 退格
+            if (!result.empty()) {
+                result.pop_back();
+                // 回退并清除字符
+                fmt::print("\b \b");
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (c >= 32 && c <= 126) { // 可打印字符
+            result += c;
+            fmt::print("{}", c);
+            fflush(stdout);
+        }
+    }
+    return result;
+}
 
 Key read_key() {
     char c;
@@ -279,6 +307,8 @@ Key read_key() {
     if (c == ' ') return Key::SPACE;
     if (c == '\n' || c == '\r') return Key::ENTER;
     if (c == 'q' || c == 'Q') return Key::Q;
+    if (c == 'm' || c == 'M') return Key::MKDIR;
+    if (c == 'n' || c == 'N') return Key::NEWFILE;
     if (c == 27) return Key::ESC;
 
     return Key::UNKNOWN;
@@ -886,6 +916,97 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                     break;
                 }
 
+                case Key::MKDIR: {
+                    // 在光标所在目录下创建新目录
+                    fs::path target_dir;
+                    if (cursor_pos >= 0 && cursor_pos < (int)all_nodes.size()) {
+                        auto &node = all_nodes[cursor_pos];
+                        if (node.is_dir) {
+                            target_dir = node.path;
+                        } else {
+                            target_dir = node.path.parent_path();
+                        }
+                    } else {
+                        target_dir = root_path;
+                    }
+
+                    // 显示提示并读取目录名
+                    status_msg = fmt::format("📁 在 {} 下创建目录，请输入目录名: ", target_dir.filename().string());
+                    need_render = true;
+                    render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                    need_render = false;
+
+                    // 在状态栏位置显示输入提示
+                    fmt::print(style::info_color, "  📁 输入目录名: ");
+                    fflush(stdout);
+                    std::string dirname = read_line_input();
+
+                    if (!dirname.empty()) {
+                        fs::path new_dir = target_dir / dirname;
+                        std::error_code ec;
+                        if (fs::create_directory(new_dir, ec)) {
+                            status_msg = fmt::format("✅ 已创建目录: {}", dirname);
+                        } else {
+                            status_msg = fmt::format("❌ 创建失败: {} ({})", dirname, ec.message());
+                        }
+                    } else {
+                        status_msg = "❌ 目录名不能为空";
+                    }
+                    need_render = true;
+                    break;
+                }
+
+                case Key::NEWFILE: {
+                    // 在光标所在目录下用 micro 创建新文件
+                    fs::path target_dir;
+                    if (cursor_pos >= 0 && cursor_pos < (int)all_nodes.size()) {
+                        auto &node = all_nodes[cursor_pos];
+                        if (node.is_dir) {
+                            target_dir = node.path;
+                        } else {
+                            target_dir = node.path.parent_path();
+                        }
+                    } else {
+                        target_dir = root_path;
+                    }
+
+                    // 显示提示并读取文件名
+                    status_msg = fmt::format("📄 在 {} 下创建文件，请输入文件名: ", target_dir.filename().string());
+                    need_render = true;
+                    render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                    need_render = false;
+
+                    fmt::print(style::info_color, "  📄 输入文件名: ");
+                    fflush(stdout);
+                    std::string filename = read_line_input();
+
+                    if (!filename.empty()) {
+                        fs::path new_file = target_dir / filename;
+                        // 如果指定了 tmux 窗格，在窗格中用 micro 打开
+                        if (!pane_id.empty()) {
+                            tmux_smart_interrupt(pane_id);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            tmux_send_keys(pane_id, fmt::format("micro '{}'", new_file.string()));
+                            status_msg = fmt::format("✅ 在窗格中用 micro 创建: {}", filename);
+                        } else {
+                            // 没有窗格，直接创建空文件
+                            std::error_code ec;
+                            if (fs::exists(new_file)) {
+                                status_msg = fmt::format("⚠️ 文件已存在: {}", filename);
+                            } else {
+                                // 创建空文件
+                                std::ofstream ofs(new_file.string());
+                                ofs.close();
+                                status_msg = fmt::format("✅ 已创建空文件: {}", filename);
+                            }
+                        }
+                    } else {
+                        status_msg = "❌ 文件名不能为空";
+                    }
+                    need_render = true;
+                    break;
+                }
+
                 case Key::Q:
                 case Key::ESC:
                     g_running = false;
@@ -1212,6 +1333,8 @@ int main(int argc, char *argv[]) {
             fmt::print("  ↑/↓        移动光标\n");
             fmt::print("  Space      目录:展开/折叠（若指定 -c 则同时在 cd 窗格中 cd 到该目录）\n");
             fmt::print("             文件:在 tmux 窗格中打开（若窗格正在运行程序则先中断）\n");
+            fmt::print("  m [空格]   在光标所在目录下创建新目录（输入目录名后按 Enter）\n");
+            fmt::print("  n [空格]   在光标所在目录下用 micro 创建新文件（输入文件名后按 Enter）\n");
             fmt::print("  q/ESC      退出交互模式\n");
             fmt::print(style::watch_color, "  💡 交互模式自动监听文件变动，有变化时自动刷新\n\n");
             fmt::print(style::title_color, "示例:\n");
