@@ -256,6 +256,8 @@ enum class Key {
     SPACE, ENTER, ESC, Q,
     MKDIR,      // m 键：创建目录
     NEWFILE,    // n 键：创建文件
+    DELETE,     // d 键：递归删除
+    CDROOT,     // u 键：cd 到最上层目录
     UNKNOWN
 };
 
@@ -309,6 +311,8 @@ Key read_key() {
     if (c == 'q' || c == 'Q') return Key::Q;
     if (c == 'm' || c == 'M') return Key::MKDIR;
     if (c == 'n' || c == 'N') return Key::NEWFILE;
+    if (c == 'd' || c == 'D') return Key::DELETE;
+    if (c == 'u' || c == 'U') return Key::CDROOT;
     if (c == 27) return Key::ESC;
 
     return Key::UNKNOWN;
@@ -319,8 +323,8 @@ Key read_key() {
 //============================================================================
 
 void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
-                        const fs::path &root_path, const std::string &pane_id,
-                        const std::string &cd_pane_id,
+                        const fs::path &root_path, const std::vector<std::string> &pane_ids,
+                        const std::vector<std::string> &cd_pane_ids,
                         const std::string &status_msg,
                         int &out_scroll_offset) {
     auto ts = get_term_size();
@@ -331,11 +335,21 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
     // 标题行
     fmt::print(style::title_color, "  📂 交互模式: ");
     fmt::print(fg(fmt::color::white) | fmt::emphasis::bold, "{}", root_path.string());
-    if (!pane_id.empty()) {
-        fmt::print(style::info_color, "  [tmux: {}]", pane_id);
+    if (!pane_ids.empty()) {
+        std::string pane_str;
+        for (size_t i = 0; i < pane_ids.size(); ++i) {
+            if (i > 0) pane_str += ",";
+            pane_str += pane_ids[i];
+        }
+        fmt::print(style::info_color, "  [tmux: {}]", pane_str);
     }
-    if (!cd_pane_id.empty()) {
-        fmt::print(style::info_color, "  [cd: {}]", cd_pane_id);
+    if (!cd_pane_ids.empty()) {
+        std::string cd_str;
+        for (size_t i = 0; i < cd_pane_ids.size(); ++i) {
+            if (i > 0) cd_str += ",";
+            cd_str += cd_pane_ids[i];
+        }
+        fmt::print(style::info_color, "  [cd: {}]", cd_str);
     }
     fmt::print("\n");
 
@@ -410,11 +424,31 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
     }
 }
 //============================================================================
-// 在指定 tmux 窗格中执行命令
+// 在指定 tmux 窗格中执行命令（支持多个窗格，逗号分隔）
 //============================================================================
 
-void tmux_send_keys(const std::string &pane_id, const std::string &cmd) {
-    if (pane_id.empty()) return;
+// 将逗号分隔的窗格 ID 字符串转为 vector
+std::vector<std::string> parse_pane_ids(const std::string &ids) {
+    std::vector<std::string> result;
+    if (ids.empty()) return result;
+    size_t start = 0, end;
+    while ((end = ids.find(',', start)) != std::string::npos) {
+        std::string id = ids.substr(start, end - start);
+        // 去除首尾空格
+        while (!id.empty() && id.front() == ' ') id.erase(0, 1);
+        while (!id.empty() && id.back() == ' ') id.pop_back();
+        if (!id.empty()) result.push_back(id);
+        start = end + 1;
+    }
+    std::string id = ids.substr(start);
+    while (!id.empty() && id.front() == ' ') id.erase(0, 1);
+    while (!id.empty() && id.back() == ' ') id.pop_back();
+    if (!id.empty()) result.push_back(id);
+    return result;
+}
+
+void tmux_send_keys(const std::vector<std::string> &pane_ids, const std::string &cmd) {
+    if (pane_ids.empty()) return;
     std::string escaped_cmd = cmd;
     // 转义单引号
     size_t pos = 0;
@@ -422,40 +456,50 @@ void tmux_send_keys(const std::string &pane_id, const std::string &cmd) {
         escaped_cmd.replace(pos, 1, "'\\''");
         pos += 4;
     }
-    std::string full_cmd = fmt::format("tmux send-keys -t '{}' '{}' Enter", pane_id, escaped_cmd);
-    std::system(full_cmd.c_str());
+    for (const auto &pane_id : pane_ids) {
+        std::string full_cmd = fmt::format("tmux send-keys -t '{}' '{}' Enter", pane_id, escaped_cmd);
+        std::system(full_cmd.c_str());
+    }
 }
 
 // 发送命令但不带 Enter（用于组合键）
-void tmux_send_keys_no_enter(const std::string &pane_id, const std::string &cmd) {
-    if (pane_id.empty()) return;
+void tmux_send_keys_no_enter(const std::vector<std::string> &pane_ids, const std::string &cmd) {
+    if (pane_ids.empty()) return;
     std::string escaped_cmd = cmd;
     size_t pos = 0;
     while ((pos = escaped_cmd.find('\'', pos)) != std::string::npos) {
         escaped_cmd.replace(pos, 1, "'\\''");
         pos += 4;
     }
-    std::string full_cmd = fmt::format("tmux send-keys -t '{}' '{}'", pane_id, escaped_cmd);
-    std::system(full_cmd.c_str());
+    for (const auto &pane_id : pane_ids) {
+        std::string full_cmd = fmt::format("tmux send-keys -t '{}' '{}'", pane_id, escaped_cmd);
+        std::system(full_cmd.c_str());
+    }
 }
 
 // 发送 Ctrl+C 到指定窗格（中断正在运行的程序）
-void tmux_send_ctrlc(const std::string &pane_id) {
-    if (pane_id.empty()) return;
-    std::string full_cmd = fmt::format("tmux send-keys -t '{}' C-c", pane_id);
-    std::system(full_cmd.c_str());
+void tmux_send_ctrlc(const std::vector<std::string> &pane_ids) {
+    if (pane_ids.empty()) return;
+    for (const auto &pane_id : pane_ids) {
+        std::string full_cmd = fmt::format("tmux send-keys -t '{}' C-c", pane_id);
+        std::system(full_cmd.c_str());
+    }
 }
 
 // 发送 Ctrl+Q 到指定窗格（用于退出 micro 等编辑器）
-void tmux_send_ctrlq(const std::string &pane_id) {
-    if (pane_id.empty()) return;
-    std::string full_cmd = fmt::format("tmux send-keys -t '{}' C-q", pane_id);
-    std::system(full_cmd.c_str());
+void tmux_send_ctrlq(const std::vector<std::string> &pane_ids) {
+    if (pane_ids.empty()) return;
+    for (const auto &pane_id : pane_ids) {
+        std::string full_cmd = fmt::format("tmux send-keys -t '{}' C-q", pane_id);
+        std::system(full_cmd.c_str());
+    }
 }
 
-// 获取 tmux 窗格当前正在运行的命令名
-std::string tmux_pane_current_command(const std::string &pane_id) {
-    if (pane_id.empty()) return "";
+// 获取 tmux 窗格当前正在运行的命令名（只检查第一个窗格）
+std::string tmux_pane_current_command(const std::vector<std::string> &pane_ids) {
+    if (pane_ids.empty()) return "";
+    // 只检查第一个窗格
+    const auto &pane_id = pane_ids[0];
     std::string full_cmd = fmt::format("tmux display-message -p -t '{}' '#{{pane_current_command}}'", pane_id);
     FILE *fp = popen(full_cmd.c_str(), "r");
     if (!fp) return "";
@@ -470,11 +514,10 @@ std::string tmux_pane_current_command(const std::string &pane_id) {
 }
 
 // 检查 tmux 窗格是否正在运行程序（非 shell 提示符状态）
-bool tmux_pane_is_busy(const std::string &pane_id) {
-    if (pane_id.empty()) return false;
-    std::string cmd = tmux_pane_current_command(pane_id);
+bool tmux_pane_is_busy(const std::vector<std::string> &pane_ids) {
+    if (pane_ids.empty()) return false;
+    std::string cmd = tmux_pane_current_command(pane_ids);
     if (cmd.empty()) return false;
-    // 如果当前命令不是 shell（zsh/bash/sh/fish），说明正在运行程序
     if (cmd != "zsh" && cmd != "bash" && cmd != "sh" && cmd != "fish" && cmd != "dash" && cmd != "ksh") {
         return true;
     }
@@ -482,25 +525,19 @@ bool tmux_pane_is_busy(const std::string &pane_id) {
 }
 
 // 智能中断：根据正在运行的程序选择合适的退出方式
-// micro 用 Ctrl+Q 退出，其他程序用 Ctrl+C 中断
-void tmux_smart_interrupt(const std::string &pane_id) {
-    if (pane_id.empty()) return;
-    std::string cmd = tmux_pane_current_command(pane_id);
+void tmux_smart_interrupt(const std::vector<std::string> &pane_ids) {
+    if (pane_ids.empty()) return;
+    std::string cmd = tmux_pane_current_command(pane_ids);
     if (cmd.empty()) return;
-    // 如果是 shell 提示符，无需中断
     if (cmd == "zsh" || cmd == "bash" || cmd == "sh" || cmd == "fish" || cmd == "dash" || cmd == "ksh") {
         return;
     }
     if (cmd == "micro" || cmd == "vim" || cmd == "nvim" || cmd == "nano" || cmd == "vi" || cmd == "emacs") {
-        // 编辑器类：先尝试 Ctrl+Q（micro 专用），再发 Ctrl+C 确保退出
-        tmux_send_ctrlq(pane_id);
+        tmux_send_ctrlq(pane_ids);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        // 对于 vim/nano 等，Ctrl+Q 可能没用，但 micro 用 Ctrl+Q 退出
-        // 再发一次 Ctrl+C 确保
-        tmux_send_ctrlc(pane_id);
+        tmux_send_ctrlc(pane_ids);
     } else {
-        // 其他程序：Ctrl+C 中断
-        tmux_send_ctrlc(pane_id);
+        tmux_send_ctrlc(pane_ids);
     }
 }
 
@@ -508,16 +545,16 @@ void tmux_smart_interrupt(const std::string &pane_id) {
 // 处理空格键操作
 //============================================================================
 
-std::string handle_space_action(TreeNode &node, const std::string &pane_id,
-                                const std::string &cd_pane_id) {
+std::string handle_space_action(TreeNode &node, const std::vector<std::string> &pane_ids,
+                                const std::vector<std::string> &cd_pane_ids) {
     if (node.is_dir) {
         // 如果指定了 cd 窗格，智能中断后 cd 到该目录
-        if (!cd_pane_id.empty()) {
-            tmux_smart_interrupt(cd_pane_id);
+        if (!cd_pane_ids.empty()) {
+            tmux_smart_interrupt(cd_pane_ids);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             std::string dirpath = node.path.string();
-            tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
-            return fmt::format("在窗格 {} 中 cd 到目录: {}", cd_pane_id, node.display_name);
+            tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", dirpath));
+            return fmt::format("在窗格中 cd 到目录: {}", node.display_name);
         }
         // 切换展开/折叠
         node.expanded = !node.expanded;
@@ -534,33 +571,30 @@ std::string handle_space_action(TreeNode &node, const std::string &pane_id,
 
         if (is_document_file(node.path)) {
             // 文档文件 - 用 micro 打开
-            if (!pane_id.empty()) {
-                // 智能中断：micro 用 Ctrl+Q 退出，其他程序用 Ctrl+C
-                tmux_smart_interrupt(pane_id);
+            if (!pane_ids.empty()) {
+                tmux_smart_interrupt(pane_ids);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                tmux_send_keys(pane_id, fmt::format("micro '{}'", filepath));
+                tmux_send_keys(pane_ids, fmt::format("micro '{}'", filepath));
                 return fmt::format("在 tmux 窗格中用 micro 打开: {}", node.display_name);
             } else {
                 return fmt::format("未指定 tmux 窗格，无法打开文件: {}", node.display_name);
             }
         } else if (is_archive_file(node.path)) {
             // 压缩包 - 显示内容
-            if (!pane_id.empty()) {
-                tmux_smart_interrupt(pane_id);
+            if (!pane_ids.empty()) {
+                tmux_smart_interrupt(pane_ids);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                tmux_send_keys(pane_id, fmt::format("echo '=== {} 内容 ==='", node.display_name));
-                // 根据扩展名选择命令
+                tmux_send_keys(pane_ids, fmt::format("echo '=== {} 内容 ==='", node.display_name));
                 auto ext = node.path.extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
                 if (ext == ".zip") {
-                    tmux_send_keys(pane_id, fmt::format("unzip -l '{}' | head -50", filepath));
+                    tmux_send_keys(pane_ids, fmt::format("unzip -l '{}' | head -50", filepath));
                 } else if (ext == ".rar") {
-                    tmux_send_keys(pane_id, fmt::format("unrar l '{}' | head -50", filepath));
+                    tmux_send_keys(pane_ids, fmt::format("unrar l '{}' | head -50", filepath));
                 } else if (ext == ".7z") {
-                    tmux_send_keys(pane_id, fmt::format("7z l '{}' | head -50", filepath));
+                    tmux_send_keys(pane_ids, fmt::format("7z l '{}' | head -50", filepath));
                 } else {
-                    // tar.gz, tar.bz2, tar.xz, tgz, etc.
-                    tmux_send_keys(pane_id, fmt::format("tar tf '{}' | head -50", filepath));
+                    tmux_send_keys(pane_ids, fmt::format("tar tf '{}' | head -50", filepath));
                 }
                 return fmt::format("显示压缩包内容: {}", node.display_name);
             } else {
@@ -568,10 +602,10 @@ std::string handle_space_action(TreeNode &node, const std::string &pane_id,
             }
         } else if (node.is_exec) {
             // 可执行文件 - 直接执行
-            if (!pane_id.empty()) {
-                tmux_smart_interrupt(pane_id);
+            if (!pane_ids.empty()) {
+                tmux_smart_interrupt(pane_ids);
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                tmux_send_keys(pane_id, fmt::format("'{}'", filepath));
+                tmux_send_keys(pane_ids, fmt::format("'{}'", filepath));
                 return fmt::format("执行: {}", node.display_name);
             } else {
                 return fmt::format("未指定 tmux 窗格，无法执行: {}", node.display_name);
@@ -617,8 +651,8 @@ void add_watch_recursive(int inotify_fd, const fs::path &dir,
 //============================================================================
 
 void interactive_mode(const fs::path &root_path, bool show_hidden,
-                      const std::string &pane_id,
-                      const std::string &cd_pane_id) {
+                      const std::vector<std::string> &pane_ids,
+                      const std::vector<std::string> &cd_pane_ids) {
     // 构建树节点列表
     std::vector<TreeNode> all_nodes;
     // 初始构建（仅根目录下一级）
@@ -817,7 +851,7 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
         // 检查键盘输入
         if (poll_ret > 0 && (pfds[0].revents & POLLIN)) {
             if (need_render) {
-                render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                render_interactive(all_nodes, cursor_pos, root_path, pane_ids, cd_pane_ids, status_msg, scroll_offset);
                 need_render = false;
                 status_msg.clear();
             }
@@ -845,11 +879,11 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
 
                         if (node.is_dir) {
                             // 如果指定了 cd 窗格，智能中断后 cd 到该目录
-                            if (!cd_pane_id.empty()) {
-                                tmux_smart_interrupt(cd_pane_id);
+                            if (!cd_pane_ids.empty()) {
+                                tmux_smart_interrupt(cd_pane_ids);
                                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                                 std::string dirpath = node.path.string();
-                                tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                                tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", dirpath));
                             }
 
                             // 无论是否指定 cd 窗格，文件树都要展开/折叠
@@ -883,8 +917,8 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                                 all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
                                                  children.begin(), children.end());
 
-                                if (!cd_pane_id.empty()) {
-                                    status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                if (!cd_pane_ids.empty()) {
+                                    status_msg = fmt::format("展开 + cd 到目录: {}", node.display_name);
                                 } else {
                                     status_msg = fmt::format("展开目录: {}", node.display_name);
                                 }
@@ -900,8 +934,8 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                                     all_nodes.erase(all_nodes.begin() + start_remove,
                                                     all_nodes.begin() + start_remove + remove_count);
                                 }
-                                if (!cd_pane_id.empty()) {
-                                    status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                if (!cd_pane_ids.empty()) {
+                                    status_msg = fmt::format("折叠 + cd 到目录: {}", node.display_name);
                                 } else {
                                     status_msg = fmt::format("折叠目录: {}", node.display_name);
                                 }
@@ -909,7 +943,7 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                             need_render = true;
                         } else {
                             // 文件操作
-                            status_msg = handle_space_action(node, pane_id, cd_pane_id);
+                            status_msg = handle_space_action(node, pane_ids, cd_pane_ids);
                             need_render = true;
                         }
                     }
@@ -930,13 +964,11 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                         target_dir = root_path;
                     }
 
-                    // 显示提示并读取目录名
                     status_msg = fmt::format("📁 在 {} 下创建目录，请输入目录名: ", target_dir.filename().string());
                     need_render = true;
-                    render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                    render_interactive(all_nodes, cursor_pos, root_path, pane_ids, cd_pane_ids, status_msg, scroll_offset);
                     need_render = false;
 
-                    // 在状态栏位置显示输入提示
                     fmt::print(style::info_color, "  📁 输入目录名: ");
                     fflush(stdout);
                     std::string dirname = read_line_input();
@@ -970,10 +1002,9 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                         target_dir = root_path;
                     }
 
-                    // 显示提示并读取文件名
                     status_msg = fmt::format("📄 在 {} 下创建文件，请输入文件名: ", target_dir.filename().string());
                     need_render = true;
-                    render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                    render_interactive(all_nodes, cursor_pos, root_path, pane_ids, cd_pane_ids, status_msg, scroll_offset);
                     need_render = false;
 
                     fmt::print(style::info_color, "  📄 输入文件名: ");
@@ -982,19 +1013,16 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
 
                     if (!filename.empty()) {
                         fs::path new_file = target_dir / filename;
-                        // 如果指定了 tmux 窗格，在窗格中用 micro 打开
-                        if (!pane_id.empty()) {
-                            tmux_smart_interrupt(pane_id);
+                        if (!pane_ids.empty()) {
+                            tmux_smart_interrupt(pane_ids);
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                            tmux_send_keys(pane_id, fmt::format("micro '{}'", new_file.string()));
+                            tmux_send_keys(pane_ids, fmt::format("micro '{}'", new_file.string()));
                             status_msg = fmt::format("✅ 在窗格中用 micro 创建: {}", filename);
                         } else {
-                            // 没有窗格，直接创建空文件
                             std::error_code ec;
                             if (fs::exists(new_file)) {
                                 status_msg = fmt::format("⚠️ 文件已存在: {}", filename);
                             } else {
-                                // 创建空文件
                                 std::ofstream ofs(new_file.string());
                                 ofs.close();
                                 status_msg = fmt::format("✅ 已创建空文件: {}", filename);
@@ -1002,6 +1030,57 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                         }
                     } else {
                         status_msg = "❌ 文件名不能为空";
+                    }
+                    need_render = true;
+                    break;
+                }
+
+                case Key::DELETE: {
+                    // 递归删除光标指向的目录或文件
+                    if (cursor_pos >= 0 && cursor_pos < (int)all_nodes.size()) {
+                        auto &node = all_nodes[cursor_pos];
+                        std::string target_name = node.display_name;
+                        fs::path target_path = node.path;
+
+                        status_msg = fmt::format("⚠️ 确认删除 \"{}\"？(y/n): ", target_name);
+                        need_render = true;
+                        render_interactive(all_nodes, cursor_pos, root_path, pane_ids, cd_pane_ids, status_msg, scroll_offset);
+                        need_render = false;
+
+                        fmt::print(style::error_color, "  ⚠️ 确认删除 \"{}\"？(y/n): ", target_name);
+                        fflush(stdout);
+
+                        // 读取确认
+                        char confirm = 0;
+                        if (read(STDIN_FILENO, &confirm, 1) == 1) {
+                            if (confirm == 'y' || confirm == 'Y') {
+                                std::error_code ec;
+                                uintmax_t removed = fs::remove_all(target_path, ec);
+                                if (!ec) {
+                                    status_msg = fmt::format("✅ 已删除: {} ({} 项)", target_name, removed);
+                                } else {
+                                    status_msg = fmt::format("❌ 删除失败: {} ({})", target_name, ec.message());
+                                }
+                            } else {
+                                status_msg = fmt::format("已取消删除: {}", target_name);
+                            }
+                        }
+                    } else {
+                        status_msg = "❌ 没有选中任何项目";
+                    }
+                    need_render = true;
+                    break;
+                }
+
+                case Key::CDROOT: {
+                    // cd 到最上层目录（根目录）
+                    if (!cd_pane_ids.empty()) {
+                        tmux_smart_interrupt(cd_pane_ids);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        tmux_send_keys(cd_pane_ids, fmt::format("cd '{}'", root_path.string()));
+                        status_msg = fmt::format("📂 已 cd 到根目录: {}", root_path.filename().string());
+                    } else {
+                        status_msg = "❌ 未指定 cd 窗格 (-c)";
                     }
                     need_render = true;
                     break;
@@ -1018,7 +1097,7 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
         } else if (poll_ret == 0) {
             // 超时：没有按键也没有文件变动，但如果有待渲染的内容则渲染
             if (need_render) {
-                render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                render_interactive(all_nodes, cursor_pos, root_path, pane_ids, cd_pane_ids, status_msg, scroll_offset);
                 need_render = false;
                 status_msg.clear();
             }
@@ -1290,8 +1369,8 @@ int main(int argc, char *argv[]) {
     bool show_hidden = false;
     bool watch_mode = false;
     bool interactive = false;
-    std::string pane_id;
-    std::string cd_pane_id;
+    std::string pane_id_str;
+    std::string cd_pane_id_str;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-r" || arg == "--recursive") {
@@ -1304,14 +1383,14 @@ int main(int argc, char *argv[]) {
             interactive = true;
         } else if (arg == "-p" || arg == "--pane") {
             if (i + 1 < argc) {
-                pane_id = argv[++i];
+                pane_id_str = argv[++i];
             } else {
                 fmt::print(stderr, style::error_color, "❌ 错误: -p/--pane 需要指定 tmux 窗格 ID\n");
                 return 1;
             }
         } else if (arg == "-c" || arg == "--cd-pane") {
             if (i + 1 < argc) {
-                cd_pane_id = argv[++i];
+                cd_pane_id_str = argv[++i];
             } else {
                 fmt::print(stderr, style::error_color, "❌ 错误: -c/--cd-pane 需要指定 tmux 窗格 ID\n");
                 return 1;
@@ -1326,8 +1405,8 @@ int main(int argc, char *argv[]) {
             fmt::print("  -a, --all          显示隐藏文件\n");
             fmt::print("  -w, --watch        实时监控模式，文件变动自动刷新\n");
             fmt::print("  -i, --interactive  交互模式，支持方向键导航和空格操作\n");
-            fmt::print("  -p, --pane ID      指定 tmux 窗格 ID（用于交互模式打开文件/执行）\n");
-            fmt::print("  -c, --cd-pane ID   指定 tmux 窗格 ID（用于交互模式 cd 到目录）\n");
+            fmt::print("  -p, --pane ID      指定 tmux 窗格 ID（多个用逗号分隔，用于打开文件/执行）\n");
+            fmt::print("  -c, --cd-pane ID   指定 tmux 窗格 ID（多个用逗号分隔，用于 cd 到目录）\n");
             fmt::print("  -h, --help         显示此帮助信息\n\n");
             fmt::print(style::title_color, "交互模式操作:\n");
             fmt::print("  ↑/↓        移动光标\n");
@@ -1335,6 +1414,8 @@ int main(int argc, char *argv[]) {
             fmt::print("             文件:在 tmux 窗格中打开（若窗格正在运行程序则先中断）\n");
             fmt::print("  m [空格]   在光标所在目录下创建新目录（输入目录名后按 Enter）\n");
             fmt::print("  n [空格]   在光标所在目录下用 micro 创建新文件（输入文件名后按 Enter）\n");
+            fmt::print("  d          递归删除光标指向的目录或文件（需确认 y/n）\n");
+            fmt::print("  u          在 cd 窗格中 cd 到最上层目录（根目录）\n");
             fmt::print("  q/ESC      退出交互模式\n");
             fmt::print(style::watch_color, "  💡 交互模式自动监听文件变动，有变化时自动刷新\n\n");
             fmt::print(style::title_color, "示例:\n");
@@ -1345,8 +1426,10 @@ int main(int argc, char *argv[]) {
             fmt::print("  listtree -w -r -a /path   # 实时监控（含隐藏文件）\n");
             fmt::print("  listtree -i               # 交互模式\n");
             fmt::print("  listtree -i -p 0          # 交互模式，tmux 窗格 0\n");
+            fmt::print("  listtree -i -p 0,1        # 交互模式，tmux 窗格 0 和 1\n");
             fmt::print("  listtree -i -p mypane:1   # 交互模式，指定 tmux 窗格\n");
-            fmt::print("  listtree -i -p 0 -c 1     # 交互模式，窗格0打开文件，窗格1 cd 到目录\n\n");
+            fmt::print("  listtree -i -p 0 -c 1     # 交互模式，窗格0打开文件，窗格1 cd 到目录\n");
+            fmt::print("  listtree -i -p 0,1 -c 2   # 交互模式，窗格0,1打开文件，窗格2 cd\n\n");
             fmt::print(style::watch_color, "💡 提示: 按 Ctrl+C 退出监控模式\n");
             return 0;
         } else {
@@ -1366,11 +1449,15 @@ int main(int argc, char *argv[]) {
 
     root_path = fs::absolute(root_path);
 
+    // 解析窗格 ID（支持逗号分隔的多个窗格）
+    std::vector<std::string> pane_ids = parse_pane_ids(pane_id_str);
+    std::vector<std::string> cd_pane_ids = parse_pane_ids(cd_pane_id_str);
+
     if (interactive) {
         // 交互模式
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
-        interactive_mode(root_path, show_hidden, pane_id, cd_pane_id);
+        interactive_mode(root_path, show_hidden, pane_ids, cd_pane_ids);
     } else if (watch_mode) {
         // 实时监控模式
         signal(SIGINT, signal_handler);
