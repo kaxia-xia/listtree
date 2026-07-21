@@ -379,13 +379,19 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
     int available_rows = ts.rows - 5;
     if (available_rows <= 0) available_rows = 10;
 
-    // 计算滚动偏移
-    int scroll_offset = 0;
-    if (cursor_pos >= available_rows) {
+    // 计算滚动偏移：让光标尽量保持在可视区域内
+    int scroll_offset = out_scroll_offset;
+    if (cursor_pos < scroll_offset) {
+        // 光标移到了可视区域上方，向上滚动
+        scroll_offset = cursor_pos;
+    } else if (cursor_pos >= scroll_offset + available_rows) {
+        // 光标移到了可视区域下方，向下滚动
         scroll_offset = cursor_pos - available_rows + 1;
     }
-    if (cursor_pos < scroll_offset) {
-        scroll_offset = cursor_pos;
+    // 边界保护
+    if (scroll_offset < 0) scroll_offset = 0;
+    if (scroll_offset > (int)nodes.size() - available_rows) {
+        scroll_offset = std::max(0, (int)nodes.size() - available_rows);
     }
     out_scroll_offset = scroll_offset;
 
