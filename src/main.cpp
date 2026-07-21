@@ -1104,6 +1104,22 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                                 std::error_code ec;
                                 uintmax_t removed = fs::remove_all(target_path, ec);
                                 if (!ec) {
+                                    // 从 all_nodes 中移除被删除的节点及其子节点
+                                    int remove_start = cursor_pos;
+                                    int remove_count = 0;
+                                    int base_depth = all_nodes[cursor_pos].depth;
+                                    for (int i = remove_start; i < (int)all_nodes.size(); ++i) {
+                                        if (all_nodes[i].depth < base_depth) break;
+                                        if (all_nodes[i].depth == base_depth && i > remove_start) break;
+                                        remove_count++;
+                                    }
+                                    all_nodes.erase(all_nodes.begin() + remove_start,
+                                                    all_nodes.begin() + remove_start + remove_count);
+                                    // 修正光标位置
+                                    if (cursor_pos >= (int)all_nodes.size()) {
+                                        cursor_pos = (int)all_nodes.size() - 1;
+                                    }
+                                    if (cursor_pos < 0) cursor_pos = 0;
                                     status_msg = fmt::format("✅ 已删除: {} ({} 项)", target_name, removed);
                                 } else {
                                     status_msg = fmt::format("❌ 删除失败: {} ({})", target_name, ec.message());
