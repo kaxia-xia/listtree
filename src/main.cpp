@@ -364,8 +364,38 @@ Key read_key() {
 // 渲染完整交互界面
 //============================================================================
 
-// 全局变量：记录渲染时的终端行号偏移
-int g_render_start_row = 1;  // 渲染起始行号（1-based）
+// 全局变量
+int g_render_start_row = 1;
+int g_last_mouse_debug_row = 0;  // 上次鼠标点击行号（用于调试显示）
+
+// 发送 DSR 查询光标位置并读取响应，返回行号（1-based），失败返回 0
+int query_cursor_row() {
+    // 清空输入缓冲区
+    tcflush(STDIN_FILENO, TCIFLUSH);
+    // 发送 DSR
+    fmt::print("\033[6n");
+    fflush(stdout);
+    // 读取响应: \033[行;列R
+    char buf[32];
+    int pos = 0;
+    // 设置超时
+    struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+    int ret = poll(&pfd, 1, 50);  // 50ms 超时
+    if (ret <= 0) return 0;
+    while (pos < (int)sizeof(buf) - 1) {
+        if (read(STDIN_FILENO, &buf[pos], 1) != 1) break;
+        if (buf[pos] == 'R') {
+            buf[pos] = '\0';
+            break;
+        }
+        pos++;
+    }
+    int row = 0, col = 0;
+    if (sscanf(buf, "\033[%d;%d", &row, &col) >= 1) {
+        return row;
+    }
+    return 0;
+}
 
 void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
                         const fs::path &root_path, const std::string &pane_id,
@@ -454,11 +484,19 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
     fmt::print("\n");
 
     if (!status_msg.empty()) {
-        fmt::print(style::info_color, "  {}\n", status_msg);
+        fmt::print(style::info_color, "  {}", status_msg);
+        if (g_last_mouse_debug_row > 0) {
+            fmt::print(style::info_color, "  [鼠标行:{}]", g_last_mouse_debug_row);
+        }
+        fmt::print("\n");
     } else {
         fmt::print(style::watch_color,
-            "  ↑↓ 移动  Space:展开/打开  鼠标:点击   q:退出  ({} / {})\n",
+            "  ↑↓ 移动  Space:展开/打开  鼠标:点击   q:退出  ({} / {})",
             cursor_pos + 1, nodes.size());
+        if (g_last_mouse_debug_row > 0) {
+            fmt::print(style::info_color, "  [行:{}]", g_last_mouse_debug_row);
+        }
+        fmt::print("\n");
     }
 }
 //============================================================================
@@ -803,33 +841,24 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_click_time).count();
                 last_click_time = now;
                 if (elapsed < 300) {
-                    // 300ms 内的重复点击忽略
                     g_last_mouse_click.valid = false;
                     break;
                 }
 
-                // 鼠标点击：将行号映射到节点索引
-                // 渲染布局（1-based 终端行号）:
-                //   行 1: 标题行
-                //   行 2: 分隔线
-                //   行 3 ~ 2+visible_count: 节点列表
-                //   行 3+visible_count: 底部分隔线
-                //   行 4+visible_count: 状态栏
-                int mouse_row = g_last_mouse_click.row;  // 已统一为 1-based
+                int mouse_row = g_last_mouse_click.row;
+                g_last_mouse_debug_row = mouse_row;
 
-                // 计算实际渲染了多少个可见节点
+                // 布局: 行1=标题, 行2=分隔线, 行3起=节点
                 auto ts = get_term_size();
                 int available_rows = ts.rows - 5;
                 if (available_rows <= 0) available_rows = 10;
                 int visible_count = std::min(available_rows, (int)all_nodes.size() - scroll_offset);
                 if (visible_count < 0) visible_count = 0;
 
-                // 节点占据的行范围（1-based 终端行号）
-                // 行 1 = 标题, 行 2 = 分隔线, 行 3 开始 = 节点
+                // 节点占据的行范围（1-based）
                 int node_start_row = 3;
                 int node_end_row = 2 + visible_count;
 
-                // 尝试多种偏移来兼容不同终端实现
                 int clicked_idx = -1;
 
                 // 尝试 1: 标准 1-based，节点从第3行开始
@@ -845,20 +874,26 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                     }
                 }
 
-                // 尝试 3: 如果鼠标行号比预期少1（某些终端从0开始计数）
+                // 尝试 3: 整体偏移 -1
                 if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
-                    int row_1based = mouse_row;
                     int adjusted_start = node_start_row - 1;
                     int adjusted_end = node_end_row - 1;
-                    if (row_1based >= adjusted_start && row_1based <= adjusted_end) {
-                        clicked_idx = scroll_offset + (row_1based - adjusted_start);
+                    if (mouse_row >= adjusted_start && mouse_row <= adjusted_end) {
+                        clicked_idx = scroll_offset + (mouse_row - adjusted_start);
+                    }
+                }
+
+                // 尝试 4: 整体偏移 +1
+                if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
+                    int adjusted_start = node_start_row + 1;
+                    int adjusted_end = node_end_row + 1;
+                    if (mouse_row >= adjusted_start && mouse_row <= adjusted_end) {
+                        clicked_idx = scroll_offset + (mouse_row - adjusted_start);
                     }
                 }
 
                 if (clicked_idx >= 0 && clicked_idx < (int)all_nodes.size()) {
-                    // 先移动光标到点击位置
                     cursor_pos = clicked_idx;
-                    // 然后执行空格操作（展开/折叠/打开）
                     auto &node = all_nodes[cursor_pos];
                     if (node.is_dir) {
                         if (!cd_pane_id.empty()) {
