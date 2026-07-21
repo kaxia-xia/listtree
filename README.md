@@ -1,6 +1,6 @@
 # listtree — 美观多彩的终端目录树查看器
 
-[![C++20](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **listtree** 是一个用 C++20 编写的命令行工具，能够在终端中以**树形结构**美观地显示目录内容。支持**实时监控**文件变动、**递归**子目录、**多彩着色**、**文件类型图标**等特性。
