@@ -246,30 +246,87 @@ void disable_raw_mode() {
 }
 
 //============================================================================
-// 读取按键（支持方向键等转义序列）
+// 读取按键（支持方向键等转义序列 + 鼠标点击）
 //============================================================================
 
 enum class Key {
     UP, DOWN, LEFT, RIGHT,
     SPACE, ENTER, ESC, Q,
+    MOUSE_CLICK,
     UNKNOWN
 };
+
+// 鼠标点击信息
+struct MouseClick {
+    int row = 0;  // 1-based row
+    int col = 0;  // 1-based col
+    bool valid = false;
+};
+
+MouseClick g_last_mouse_click;
+
+// 启用终端鼠标跟踪（SGR 模式，支持点击位置上报）
+void enable_mouse_tracking() {
+    // 启用 SGR 扩展鼠标模式 + 按钮事件跟踪
+    fmt::print("\033[?1000h\033[?1002h\033[?1006h");
+    fflush(stdout);
+}
+
+// 禁用终端鼠标跟踪
+void disable_mouse_tracking() {
+    fmt::print("\033[?1006l\033[?1002l\033[?1000l");
+    fflush(stdout);
+}
 
 Key read_key() {
     char c;
     if (read(STDIN_FILENO, &c, 1) != 1) return Key::UNKNOWN;
 
     if (c == '\033') {
-        char seq[2];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return Key::ESC;
+        char seq[4];
+        // 尝试读取更多字节来判断是方向键还是鼠标事件
+        int n = read(STDIN_FILENO, &seq[0], 1);
+        if (n != 1) return Key::ESC;
+
         if (seq[0] == '[') {
-            if (read(STDIN_FILENO, &seq[1], 1) != 1) return Key::UNKNOWN;
+            // 尝试读取下一个字节
+            n = read(STDIN_FILENO, &seq[1], 1);
+            if (n != 1) return Key::UNKNOWN;
+
+            // SGR 鼠标模式: \033[<...;...;...M 或 \033[<...;...;...m
+            if (seq[1] == '<') {
+                // SGR 鼠标编码: ESC [ < Cb ; Cx ; Cy M 或 m
+                // 读取直到遇到 M 或 m
+                std::string mouse_buf;
+                char ch;
+                while (read(STDIN_FILENO, &ch, 1) == 1) {
+                    if (ch == 'M' || ch == 'm') break;
+                    mouse_buf += ch;
+                }
+                // 解析: <button>;<col>;<row>
+                int btn = 0, col = 0, row = 0;
+                if (sscanf(mouse_buf.c_str(), "%d;%d;%d", &btn, &col, &row) >= 3) {
+                    // 只处理按下事件（btn & 32 表示释放，btn & 64 表示移动）
+                    if (!(btn & 32) && !(btn & 64)) {
+                        g_last_mouse_click.row = row;
+                        g_last_mouse_click.col = col;
+                        g_last_mouse_click.valid = true;
+                        return Key::MOUSE_CLICK;
+                    }
+                }
+                return Key::UNKNOWN;
+            }
+
+            // 普通方向键/功能键
             switch (seq[1]) {
                 case 'A': return Key::UP;
                 case 'B': return Key::DOWN;
                 case 'C': return Key::RIGHT;
                 case 'D': return Key::LEFT;
-                default: return Key::UNKNOWN;
+                default: {
+                    // 可能是 \033[? 开头的序列，忽略
+                    return Key::UNKNOWN;
+                }
             }
         }
         return Key::UNKNOWN;
@@ -290,7 +347,8 @@ Key read_key() {
 void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
                         const fs::path &root_path, const std::string &pane_id,
                         const std::string &cd_pane_id,
-                        const std::string &status_msg) {
+                        const std::string &status_msg,
+                        int &out_scroll_offset) {
     auto ts = get_term_size();
 
     // 清屏
@@ -324,6 +382,7 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
     if (cursor_pos < scroll_offset) {
         scroll_offset = cursor_pos;
     }
+    out_scroll_offset = scroll_offset;
 
     // 渲染可见节点
     int start_idx = scroll_offset;
@@ -372,7 +431,7 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
         fmt::print(style::info_color, "  {}\n", status_msg);
     } else {
         fmt::print(style::watch_color,
-            "  ↑↓ 移动  Space:展开/打开  q:退出  ({} / {})\n",
+            "  ↑↓ 移动  Space:展开/打开  鼠标:点击   q:退出  ({} / {})\n",
             cursor_pos + 1, nodes.size());
     }
 }
@@ -588,24 +647,31 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
     // 设置终端为原始模式
     enable_raw_mode();
 
+    // 启用鼠标跟踪
+    enable_mouse_tracking();
+
     // 隐藏光标
     fmt::print("\033[?25l");
 
     // 注册信号恢复终端
     signal(SIGINT, [](int) {
+        disable_mouse_tracking();
         disable_raw_mode();
         fmt::print("\033[?25h\033[2J\033[H");
         exit(0);
     });
     signal(SIGTERM, [](int) {
+        disable_mouse_tracking();
         disable_raw_mode();
         fmt::print("\033[?25h\033[2J\033[H");
         exit(0);
     });
 
+    int scroll_offset = 0;
+
     while (g_running) {
         if (need_render) {
-            render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg);
+            render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
             need_render = false;
             status_msg.clear();
         }
@@ -704,6 +770,78 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                 break;
             }
 
+            case Key::MOUSE_CLICK: {
+                // 鼠标点击：将行号映射到节点索引
+                // 布局: row1=标题, row2=分隔线, row3+=节点列表, 最后2行=分隔线+状态栏
+                int mouse_row = g_last_mouse_click.row;
+                int node_row_start = 3;  // 节点从第3行开始
+                int clicked_idx = scroll_offset + (mouse_row - node_row_start);
+                if (clicked_idx >= 0 && clicked_idx < (int)all_nodes.size()) {
+                    // 先移动光标到点击位置
+                    cursor_pos = clicked_idx;
+                    // 然后执行空格操作（展开/折叠/打开）
+                    auto &node = all_nodes[cursor_pos];
+                    if (node.is_dir) {
+                        if (!cd_pane_id.empty()) {
+                            tmux_smart_interrupt(cd_pane_id);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            std::string dirpath = node.path.string();
+                            tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                        }
+                        bool was_expanded = node.expanded;
+                        node.expanded = !was_expanded;
+                        if (node.expanded) {
+                            std::vector<fs::directory_entry> entries;
+                            try {
+                                for (auto &entry : fs::directory_iterator(node.path)) {
+                                    if (!show_hidden && is_hidden(entry.path())) continue;
+                                    entries.push_back(entry);
+                                }
+                            } catch (const fs::filesystem_error &) {}
+                            std::sort(entries.begin(), entries.end(),
+                                      [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                          bool a_is_dir = a.is_directory();
+                                          bool b_is_dir = b.is_directory();
+                                          if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                          return a.path().filename().string() < b.path().filename().string();
+                                      });
+                            std::vector<TreeNode> children;
+                            for (auto &entry : entries) {
+                                children.emplace_back(entry, node.depth + 1);
+                            }
+                            all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
+                                             children.begin(), children.end());
+                            if (!cd_pane_id.empty()) {
+                                status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                            } else {
+                                status_msg = fmt::format("展开目录: {}", node.display_name);
+                            }
+                        } else {
+                            int remove_count = 0;
+                            int start_remove = cursor_pos + 1;
+                            for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
+                                if (all_nodes[i].depth <= node.depth) break;
+                                remove_count++;
+                            }
+                            if (remove_count > 0) {
+                                all_nodes.erase(all_nodes.begin() + start_remove,
+                                                all_nodes.begin() + start_remove + remove_count);
+                            }
+                            if (!cd_pane_id.empty()) {
+                                status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                            } else {
+                                status_msg = fmt::format("折叠目录: {}", node.display_name);
+                            }
+                        }
+                    } else {
+                        status_msg = handle_space_action(node, pane_id, cd_pane_id);
+                    }
+                    need_render = true;
+                }
+                g_last_mouse_click.valid = false;
+                break;
+            }
+
             case Key::Q:
             case Key::ESC:
                 g_running = false;
@@ -715,6 +853,7 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
     }
 
     // 恢复终端
+    disable_mouse_tracking();
     disable_raw_mode();
     fmt::print("\033[?25h\033[2J\033[H");
     fmt::print(style::watch_color, "  👋 交互模式已退出\n");
@@ -1044,6 +1183,7 @@ int main(int argc, char *argv[]) {
             fmt::print("  ↑/↓        移动光标\n");
             fmt::print("  Space      目录:展开/折叠（若指定 -c 则同时在 cd 窗格中 cd 到该目录）\n");
             fmt::print("             文件:在 tmux 窗格中打开（若窗格正在运行程序则先中断）\n");
+            fmt::print("  鼠标点击   点击节点相当于移动光标到该位置并按下空格\n");
             fmt::print("  q/ESC      退出交互模式\n\n");
             fmt::print(style::title_color, "示例:\n");
             fmt::print("  listtree\n");
