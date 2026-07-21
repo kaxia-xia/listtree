@@ -797,15 +797,25 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
             }
 
             case Key::MOUSE_CLICK: {
+                // 防抖：防止一次点击触发多次事件（SGR + 普通模式同时触发）
+                static auto last_click_time = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_click_time).count();
+                last_click_time = now;
+                if (elapsed < 300) {
+                    // 300ms 内的重复点击忽略
+                    g_last_mouse_click.valid = false;
+                    break;
+                }
+
                 // 鼠标点击：将行号映射到节点索引
                 // 渲染布局（1-based 终端行号）:
-                //   行 base+0: 标题行
-                //   行 base+1: 分隔线
-                //   行 base+2 ~ base+1+visible_count: 节点列表
-                //   行 base+2+visible_count: 底部分隔线
-                //   行 base+3+visible_count: 状态栏
+                //   行 1: 标题行
+                //   行 2: 分隔线
+                //   行 3 ~ 2+visible_count: 节点列表
+                //   行 3+visible_count: 底部分隔线
+                //   行 4+visible_count: 状态栏
                 int mouse_row = g_last_mouse_click.row;  // 已统一为 1-based
-                int base = g_render_start_row;  // 始终为 1
 
                 // 计算实际渲染了多少个可见节点
                 auto ts = get_term_size();
@@ -815,73 +825,97 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                 if (visible_count < 0) visible_count = 0;
 
                 // 节点占据的行范围（1-based 终端行号）
-                int node_start_row = base + 2;  // 标题(base+0) + 分隔线(base+1) = 第一个节点在 base+2
-                int node_end_row = base + 1 + visible_count;  // 最后一个节点
+                // 行 1 = 标题, 行 2 = 分隔线, 行 3 开始 = 节点
+                int node_start_row = 3;
+                int node_end_row = 2 + visible_count;
 
+                // 尝试多种偏移来兼容不同终端实现
+                int clicked_idx = -1;
+
+                // 尝试 1: 标准 1-based，节点从第3行开始
                 if (mouse_row >= node_start_row && mouse_row <= node_end_row) {
-                    int clicked_idx = scroll_offset + (mouse_row - node_start_row);
-                    if (clicked_idx >= 0 && clicked_idx < (int)all_nodes.size()) {
-                        // 先移动光标到点击位置
-                        cursor_pos = clicked_idx;
-                        // 然后执行空格操作（展开/折叠/打开）
-                        auto &node = all_nodes[cursor_pos];
-                        if (node.is_dir) {
-                            if (!cd_pane_id.empty()) {
-                                tmux_smart_interrupt(cd_pane_id);
-                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                                std::string dirpath = node.path.string();
-                                tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                    clicked_idx = scroll_offset + (mouse_row - node_start_row);
+                }
+
+                // 尝试 2: 如果鼠标行号是 0-based（某些终端），转成 1-based
+                if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
+                    int row_1based = mouse_row + 1;
+                    if (row_1based >= node_start_row && row_1based <= node_end_row) {
+                        clicked_idx = scroll_offset + (row_1based - node_start_row);
+                    }
+                }
+
+                // 尝试 3: 如果鼠标行号比预期少1（某些终端从0开始计数）
+                if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
+                    int row_1based = mouse_row;
+                    int adjusted_start = node_start_row - 1;
+                    int adjusted_end = node_end_row - 1;
+                    if (row_1based >= adjusted_start && row_1based <= adjusted_end) {
+                        clicked_idx = scroll_offset + (row_1based - adjusted_start);
+                    }
+                }
+
+                if (clicked_idx >= 0 && clicked_idx < (int)all_nodes.size()) {
+                    // 先移动光标到点击位置
+                    cursor_pos = clicked_idx;
+                    // 然后执行空格操作（展开/折叠/打开）
+                    auto &node = all_nodes[cursor_pos];
+                    if (node.is_dir) {
+                        if (!cd_pane_id.empty()) {
+                            tmux_smart_interrupt(cd_pane_id);
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            std::string dirpath = node.path.string();
+                            tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                        }
+                        bool was_expanded = node.expanded;
+                        node.expanded = !was_expanded;
+                        if (node.expanded) {
+                            std::vector<fs::directory_entry> entries;
+                            try {
+                                for (auto &entry : fs::directory_iterator(node.path)) {
+                                    if (!show_hidden && is_hidden(entry.path())) continue;
+                                    entries.push_back(entry);
+                                }
+                            } catch (const fs::filesystem_error &) {}
+                            std::sort(entries.begin(), entries.end(),
+                                      [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                          bool a_is_dir = a.is_directory();
+                                          bool b_is_dir = b.is_directory();
+                                          if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                          return a.path().filename().string() < b.path().filename().string();
+                                      });
+                            std::vector<TreeNode> children;
+                            for (auto &entry : entries) {
+                                children.emplace_back(entry, node.depth + 1);
                             }
-                            bool was_expanded = node.expanded;
-                            node.expanded = !was_expanded;
-                            if (node.expanded) {
-                                std::vector<fs::directory_entry> entries;
-                                try {
-                                    for (auto &entry : fs::directory_iterator(node.path)) {
-                                        if (!show_hidden && is_hidden(entry.path())) continue;
-                                        entries.push_back(entry);
-                                    }
-                                } catch (const fs::filesystem_error &) {}
-                                std::sort(entries.begin(), entries.end(),
-                                          [](const fs::directory_entry &a, const fs::directory_entry &b) {
-                                              bool a_is_dir = a.is_directory();
-                                              bool b_is_dir = b.is_directory();
-                                              if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
-                                              return a.path().filename().string() < b.path().filename().string();
-                                          });
-                                std::vector<TreeNode> children;
-                                for (auto &entry : entries) {
-                                    children.emplace_back(entry, node.depth + 1);
-                                }
-                                all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
-                                                 children.begin(), children.end());
-                                if (!cd_pane_id.empty()) {
-                                    status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
-                                } else {
-                                    status_msg = fmt::format("展开目录: {}", node.display_name);
-                                }
+                            all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
+                                             children.begin(), children.end());
+                            if (!cd_pane_id.empty()) {
+                                status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
                             } else {
-                                int remove_count = 0;
-                                int start_remove = cursor_pos + 1;
-                                for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
-                                    if (all_nodes[i].depth <= node.depth) break;
-                                    remove_count++;
-                                }
-                                if (remove_count > 0) {
-                                    all_nodes.erase(all_nodes.begin() + start_remove,
-                                                    all_nodes.begin() + start_remove + remove_count);
-                                }
-                                if (!cd_pane_id.empty()) {
-                                    status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
-                                } else {
-                                    status_msg = fmt::format("折叠目录: {}", node.display_name);
-                                }
+                                status_msg = fmt::format("展开目录: {}", node.display_name);
                             }
                         } else {
-                            status_msg = handle_space_action(node, pane_id, cd_pane_id);
+                            int remove_count = 0;
+                            int start_remove = cursor_pos + 1;
+                            for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
+                                if (all_nodes[i].depth <= node.depth) break;
+                                remove_count++;
+                            }
+                            if (remove_count > 0) {
+                                all_nodes.erase(all_nodes.begin() + start_remove,
+                                                all_nodes.begin() + start_remove + remove_count);
+                            }
+                            if (!cd_pane_id.empty()) {
+                                status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                            } else {
+                                status_msg = fmt::format("折叠目录: {}", node.display_name);
+                            }
                         }
-                        need_render = true;
+                    } else {
+                        status_msg = handle_space_action(node, pane_id, cd_pane_id);
                     }
+                    need_render = true;
                 }
                 g_last_mouse_click.valid = false;
                 break;
