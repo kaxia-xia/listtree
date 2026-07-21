@@ -265,9 +265,10 @@ struct MouseClick {
 
 MouseClick g_last_mouse_click;
 
-// 启用终端鼠标跟踪（SGR 模式，支持点击位置上报）
+// 启用终端鼠标跟踪（同时启用普通模式和 SGR 模式以兼容不同终端）
 void enable_mouse_tracking() {
     // 启用 SGR 扩展鼠标模式 + 按钮事件跟踪
+    // 先尝试 SGR 模式（\033[?1006h），某些终端不支持时会忽略
     fmt::print("\033[?1000h\033[?1002h\033[?1006h");
     fflush(stdout);
 }
@@ -308,6 +309,7 @@ Key read_key() {
                 if (sscanf(mouse_buf.c_str(), "%d;%d;%d", &btn, &col, &row) >= 3) {
                     // 只处理按下事件（btn & 32 表示释放，btn & 64 表示移动）
                     if (!(btn & 32) && !(btn & 64)) {
+                        // SGR 模式行号是 1-based
                         g_last_mouse_click.row = row;
                         g_last_mouse_click.col = col;
                         g_last_mouse_click.valid = true;
@@ -324,7 +326,25 @@ Key read_key() {
                 case 'C': return Key::RIGHT;
                 case 'D': return Key::LEFT;
                 default: {
-                    // 可能是 \033[? 开头的序列，忽略
+                    // 普通鼠标模式: \033[Mbxy（b=按钮+32, x=col+32, y=row+32）
+                    // 只有 seq[0]=='M' 才可能是鼠标事件（方向键的 seq[0] 也是 '['）
+                    if (seq[0] == 'M' && seq[1] >= ' ' && seq[1] <= '~') {
+                        unsigned char btn = static_cast<unsigned char>(seq[1]) - 32;
+                        // 读取 x 和 y
+                        char xy[2];
+                        if (read(STDIN_FILENO, &xy[0], 1) == 1 && read(STDIN_FILENO, &xy[1], 1) == 1) {
+                            // 只处理按下事件（btn & 32 表示释放，btn & 64 表示移动）
+                            if (!(btn & 32) && !(btn & 64)) {
+                                int col = static_cast<unsigned char>(xy[0]) - 32;
+                                int row = static_cast<unsigned char>(xy[1]) - 32;
+                                // 普通模式行号是 0-based，转成 1-based 方便统一处理
+                                g_last_mouse_click.row = row + 1;
+                                g_last_mouse_click.col = col + 1;
+                                g_last_mouse_click.valid = true;
+                                return Key::MOUSE_CLICK;
+                            }
+                        }
+                    }
                     return Key::UNKNOWN;
                 }
             }
@@ -344,6 +364,9 @@ Key read_key() {
 // 渲染完整交互界面
 //============================================================================
 
+// 全局变量：记录渲染时的终端行号偏移
+int g_render_start_row = 1;  // 渲染起始行号（1-based）
+
 void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
                         const fs::path &root_path, const std::string &pane_id,
                         const std::string &cd_pane_id,
@@ -353,6 +376,9 @@ void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
 
     // 清屏
     fmt::print("\033[2J\033[H");
+
+    // 记录渲染起始行（\033[H 将光标移到第1行）
+    g_render_start_row = 1;
 
     // 标题行
     fmt::print(style::title_color, "  📂 交互模式: ");
@@ -772,71 +798,90 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
 
             case Key::MOUSE_CLICK: {
                 // 鼠标点击：将行号映射到节点索引
-                // 布局: row1=标题, row2=分隔线, row3+=节点列表, 最后2行=分隔线+状态栏
-                int mouse_row = g_last_mouse_click.row;
-                int node_row_start = 3;  // 节点从第3行开始
-                int clicked_idx = scroll_offset + (mouse_row - node_row_start);
-                if (clicked_idx >= 0 && clicked_idx < (int)all_nodes.size()) {
-                    // 先移动光标到点击位置
-                    cursor_pos = clicked_idx;
-                    // 然后执行空格操作（展开/折叠/打开）
-                    auto &node = all_nodes[cursor_pos];
-                    if (node.is_dir) {
-                        if (!cd_pane_id.empty()) {
-                            tmux_smart_interrupt(cd_pane_id);
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                            std::string dirpath = node.path.string();
-                            tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
-                        }
-                        bool was_expanded = node.expanded;
-                        node.expanded = !was_expanded;
-                        if (node.expanded) {
-                            std::vector<fs::directory_entry> entries;
-                            try {
-                                for (auto &entry : fs::directory_iterator(node.path)) {
-                                    if (!show_hidden && is_hidden(entry.path())) continue;
-                                    entries.push_back(entry);
-                                }
-                            } catch (const fs::filesystem_error &) {}
-                            std::sort(entries.begin(), entries.end(),
-                                      [](const fs::directory_entry &a, const fs::directory_entry &b) {
-                                          bool a_is_dir = a.is_directory();
-                                          bool b_is_dir = b.is_directory();
-                                          if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
-                                          return a.path().filename().string() < b.path().filename().string();
-                                      });
-                            std::vector<TreeNode> children;
-                            for (auto &entry : entries) {
-                                children.emplace_back(entry, node.depth + 1);
-                            }
-                            all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
-                                             children.begin(), children.end());
+                // 渲染布局（1-based 终端行号）:
+                //   行 base+0: 标题行
+                //   行 base+1: 分隔线
+                //   行 base+2 ~ base+1+visible_count: 节点列表
+                //   行 base+2+visible_count: 底部分隔线
+                //   行 base+3+visible_count: 状态栏
+                int mouse_row = g_last_mouse_click.row;  // 已统一为 1-based
+                int base = g_render_start_row;  // 始终为 1
+
+                // 计算实际渲染了多少个可见节点
+                auto ts = get_term_size();
+                int available_rows = ts.rows - 5;
+                if (available_rows <= 0) available_rows = 10;
+                int visible_count = std::min(available_rows, (int)all_nodes.size() - scroll_offset);
+                if (visible_count < 0) visible_count = 0;
+
+                // 节点占据的行范围（1-based 终端行号）
+                int node_start_row = base + 2;  // 标题(base+0) + 分隔线(base+1) = 第一个节点在 base+2
+                int node_end_row = base + 1 + visible_count;  // 最后一个节点
+
+                if (mouse_row >= node_start_row && mouse_row <= node_end_row) {
+                    int clicked_idx = scroll_offset + (mouse_row - node_start_row);
+                    if (clicked_idx >= 0 && clicked_idx < (int)all_nodes.size()) {
+                        // 先移动光标到点击位置
+                        cursor_pos = clicked_idx;
+                        // 然后执行空格操作（展开/折叠/打开）
+                        auto &node = all_nodes[cursor_pos];
+                        if (node.is_dir) {
                             if (!cd_pane_id.empty()) {
-                                status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                tmux_smart_interrupt(cd_pane_id);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                std::string dirpath = node.path.string();
+                                tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                            }
+                            bool was_expanded = node.expanded;
+                            node.expanded = !was_expanded;
+                            if (node.expanded) {
+                                std::vector<fs::directory_entry> entries;
+                                try {
+                                    for (auto &entry : fs::directory_iterator(node.path)) {
+                                        if (!show_hidden && is_hidden(entry.path())) continue;
+                                        entries.push_back(entry);
+                                    }
+                                } catch (const fs::filesystem_error &) {}
+                                std::sort(entries.begin(), entries.end(),
+                                          [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                              bool a_is_dir = a.is_directory();
+                                              bool b_is_dir = b.is_directory();
+                                              if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                              return a.path().filename().string() < b.path().filename().string();
+                                          });
+                                std::vector<TreeNode> children;
+                                for (auto &entry : entries) {
+                                    children.emplace_back(entry, node.depth + 1);
+                                }
+                                all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
+                                                 children.begin(), children.end());
+                                if (!cd_pane_id.empty()) {
+                                    status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                } else {
+                                    status_msg = fmt::format("展开目录: {}", node.display_name);
+                                }
                             } else {
-                                status_msg = fmt::format("展开目录: {}", node.display_name);
+                                int remove_count = 0;
+                                int start_remove = cursor_pos + 1;
+                                for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
+                                    if (all_nodes[i].depth <= node.depth) break;
+                                    remove_count++;
+                                }
+                                if (remove_count > 0) {
+                                    all_nodes.erase(all_nodes.begin() + start_remove,
+                                                    all_nodes.begin() + start_remove + remove_count);
+                                }
+                                if (!cd_pane_id.empty()) {
+                                    status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                } else {
+                                    status_msg = fmt::format("折叠目录: {}", node.display_name);
+                                }
                             }
                         } else {
-                            int remove_count = 0;
-                            int start_remove = cursor_pos + 1;
-                            for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
-                                if (all_nodes[i].depth <= node.depth) break;
-                                remove_count++;
-                            }
-                            if (remove_count > 0) {
-                                all_nodes.erase(all_nodes.begin() + start_remove,
-                                                all_nodes.begin() + start_remove + remove_count);
-                            }
-                            if (!cd_pane_id.empty()) {
-                                status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
-                            } else {
-                                status_msg = fmt::format("折叠目录: {}", node.display_name);
-                            }
+                            status_msg = handle_space_action(node, pane_id, cd_pane_id);
                         }
-                    } else {
-                        status_msg = handle_space_action(node, pane_id, cd_pane_id);
+                        need_render = true;
                     }
-                    need_render = true;
                 }
                 g_last_mouse_click.valid = false;
                 break;
