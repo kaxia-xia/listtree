@@ -413,26 +413,62 @@ void tmux_send_ctrlc(const std::string &pane_id) {
     std::system(full_cmd.c_str());
 }
 
+// 发送 Ctrl+Q 到指定窗格（用于退出 micro 等编辑器）
+void tmux_send_ctrlq(const std::string &pane_id) {
+    if (pane_id.empty()) return;
+    std::string full_cmd = fmt::format("tmux send-keys -t '{}' C-q", pane_id);
+    std::system(full_cmd.c_str());
+}
+
+// 获取 tmux 窗格当前正在运行的命令名
+std::string tmux_pane_current_command(const std::string &pane_id) {
+    if (pane_id.empty()) return "";
+    std::string full_cmd = fmt::format("tmux display-message -p -t '{}' '#{{pane_current_command}}'", pane_id);
+    FILE *fp = popen(full_cmd.c_str(), "r");
+    if (!fp) return "";
+    char buf[128] = {};
+    std::string result;
+    if (fgets(buf, sizeof(buf), fp) != nullptr) {
+        result = buf;
+        if (!result.empty() && result.back() == '\n') result.pop_back();
+    }
+    pclose(fp);
+    return result;
+}
+
 // 检查 tmux 窗格是否正在运行程序（非 shell 提示符状态）
 bool tmux_pane_is_busy(const std::string &pane_id) {
     if (pane_id.empty()) return false;
-    std::string full_cmd = fmt::format("tmux display-message -p -t '{}' '#{{pane_current_command}}'", pane_id);
-    FILE *fp = popen(full_cmd.c_str(), "r");
-    if (!fp) return false;
-    char buf[128] = {};
-    if (fgets(buf, sizeof(buf), fp) != nullptr) {
-        pclose(fp);
-        std::string cmd(buf);
-        // 去除换行
-        if (!cmd.empty() && cmd.back() == '\n') cmd.pop_back();
-        // 如果当前命令不是 shell（zsh/bash/sh/fish），说明正在运行程序
-        if (cmd != "zsh" && cmd != "bash" && cmd != "sh" && cmd != "fish" && cmd != "dash" && cmd != "ksh") {
-            return true;
-        }
-        return false;
+    std::string cmd = tmux_pane_current_command(pane_id);
+    if (cmd.empty()) return false;
+    // 如果当前命令不是 shell（zsh/bash/sh/fish），说明正在运行程序
+    if (cmd != "zsh" && cmd != "bash" && cmd != "sh" && cmd != "fish" && cmd != "dash" && cmd != "ksh") {
+        return true;
     }
-    pclose(fp);
     return false;
+}
+
+// 智能中断：根据正在运行的程序选择合适的退出方式
+// micro 用 Ctrl+Q 退出，其他程序用 Ctrl+C 中断
+void tmux_smart_interrupt(const std::string &pane_id) {
+    if (pane_id.empty()) return;
+    std::string cmd = tmux_pane_current_command(pane_id);
+    if (cmd.empty()) return;
+    // 如果是 shell 提示符，无需中断
+    if (cmd == "zsh" || cmd == "bash" || cmd == "sh" || cmd == "fish" || cmd == "dash" || cmd == "ksh") {
+        return;
+    }
+    if (cmd == "micro" || cmd == "vim" || cmd == "nvim" || cmd == "nano" || cmd == "vi" || cmd == "emacs") {
+        // 编辑器类：先尝试 Ctrl+Q（micro 专用），再发 Ctrl+C 确保退出
+        tmux_send_ctrlq(pane_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // 对于 vim/nano 等，Ctrl+Q 可能没用，但 micro 用 Ctrl+Q 退出
+        // 再发一次 Ctrl+C 确保
+        tmux_send_ctrlc(pane_id);
+    } else {
+        // 其他程序：Ctrl+C 中断
+        tmux_send_ctrlc(pane_id);
+    }
 }
 
 //============================================================================
@@ -442,12 +478,10 @@ bool tmux_pane_is_busy(const std::string &pane_id) {
 std::string handle_space_action(TreeNode &node, const std::string &pane_id,
                                 const std::string &cd_pane_id) {
     if (node.is_dir) {
-        // 如果指定了 cd 窗格，先中断正在运行的程序，然后 cd 到该目录
+        // 如果指定了 cd 窗格，智能中断后 cd 到该目录
         if (!cd_pane_id.empty()) {
-            // 先发送 Ctrl+C 中断可能正在运行的程序
-            tmux_send_ctrlc(cd_pane_id);
+            tmux_smart_interrupt(cd_pane_id);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            // cd 到目录
             std::string dirpath = node.path.string();
             tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
             return fmt::format("在窗格 {} 中 cd 到目录: {}", cd_pane_id, node.display_name);
@@ -468,11 +502,9 @@ std::string handle_space_action(TreeNode &node, const std::string &pane_id,
         if (is_document_file(node.path)) {
             // 文档文件 - 用 micro 打开
             if (!pane_id.empty()) {
-                // 先检查窗格是否正在运行程序，如果是则先中断
-                if (tmux_pane_is_busy(pane_id)) {
-                    tmux_send_ctrlc(pane_id);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                }
+                // 智能中断：micro 用 Ctrl+Q 退出，其他程序用 Ctrl+C
+                tmux_smart_interrupt(pane_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 tmux_send_keys(pane_id, fmt::format("micro '{}'", filepath));
                 return fmt::format("在 tmux 窗格中用 micro 打开: {}", node.display_name);
             } else {
@@ -481,11 +513,8 @@ std::string handle_space_action(TreeNode &node, const std::string &pane_id,
         } else if (is_archive_file(node.path)) {
             // 压缩包 - 显示内容
             if (!pane_id.empty()) {
-                // 先检查窗格是否正在运行程序，如果是则先中断
-                if (tmux_pane_is_busy(pane_id)) {
-                    tmux_send_ctrlc(pane_id);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                }
+                tmux_smart_interrupt(pane_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 tmux_send_keys(pane_id, fmt::format("echo '=== {} 内容 ==='", node.display_name));
                 // 根据扩展名选择命令
                 auto ext = node.path.extension().string();
@@ -507,11 +536,8 @@ std::string handle_space_action(TreeNode &node, const std::string &pane_id,
         } else if (node.is_exec) {
             // 可执行文件 - 直接执行
             if (!pane_id.empty()) {
-                // 先检查窗格是否正在运行程序，如果是则先中断
-                if (tmux_pane_is_busy(pane_id)) {
-                    tmux_send_ctrlc(pane_id);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-                }
+                tmux_smart_interrupt(pane_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 tmux_send_keys(pane_id, fmt::format("'{}'", filepath));
                 return fmt::format("执行: {}", node.display_name);
             } else {
@@ -606,9 +632,9 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                     auto &node = all_nodes[cursor_pos];
 
                     if (node.is_dir) {
-                        // 如果指定了 cd 窗格，先中断正在运行的程序，然后 cd 到该目录
+                        // 如果指定了 cd 窗格，智能中断后 cd 到该目录
                         if (!cd_pane_id.empty()) {
-                            tmux_send_ctrlc(cd_pane_id);
+                            tmux_smart_interrupt(cd_pane_id);
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                             std::string dirpath = node.path.string();
                             tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
