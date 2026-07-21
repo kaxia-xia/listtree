@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -552,6 +553,36 @@ std::string handle_space_action(TreeNode &node, const std::string &pane_id,
 }
 
 //============================================================================
+// inotify 监控辅助（用于交互模式实时监听文件变动）
+//============================================================================
+
+struct WatchDir {
+    int wd;
+    fs::path path;
+};
+
+void add_watch_recursive(int inotify_fd, const fs::path &dir,
+                         std::vector<WatchDir> &watches, bool show_hidden) {
+    // 添加当前目录
+    int wd = inotify_add_watch(inotify_fd, dir.c_str(),
+                               IN_CREATE | IN_DELETE | IN_MODIFY |
+                               IN_MOVED_FROM | IN_MOVED_TO |
+                               IN_ATTRIB | IN_DELETE_SELF);
+    if (wd >= 0) {
+        watches.push_back({wd, dir});
+    }
+
+    // 递归添加子目录
+    std::error_code ec;
+    for (auto &entry : fs::directory_iterator(dir, ec)) {
+        if (entry.is_directory()) {
+            if (!show_hidden && is_hidden(entry.path())) continue;
+            add_watch_recursive(inotify_fd, entry.path(), watches, show_hidden);
+        }
+    }
+}
+
+//============================================================================
 // 交互模式主循环
 //============================================================================
 
@@ -583,6 +614,13 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
         }
     }
 
+    // 初始化 inotify 监控
+    int inotify_fd = inotify_init1(IN_NONBLOCK);
+    std::vector<WatchDir> watches;
+    if (inotify_fd >= 0) {
+        add_watch_recursive(inotify_fd, root_path, watches, show_hidden);
+    }
+
     int cursor_pos = 0;
     std::string status_msg;
     bool need_render = true;
@@ -607,115 +645,271 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
 
     int scroll_offset = 0;
 
+    // 事件缓冲区
+    char inotify_buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    auto last_refresh = std::chrono::steady_clock::now();
+
     while (g_running) {
-        if (need_render) {
-            render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
-            need_render = false;
-            status_msg.clear();
+        // 使用 poll 同时监听 stdin 和 inotify
+        struct pollfd pfds[2];
+        pfds[0].fd = STDIN_FILENO;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = inotify_fd;
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+
+        int poll_ret = poll(pfds, 2, 500); // 500ms 超时
+
+        if (poll_ret < 0) {
+            if (errno == EINTR) continue;
+            break;
         }
 
-        Key key = read_key();
+        // 检查 inotify 事件（文件变动）
+        if (poll_ret > 0 && (pfds[1].revents & POLLIN)) {
+            ssize_t len = read(inotify_fd, inotify_buf, sizeof(inotify_buf));
+            if (len > 0) {
+                bool need_refresh = false;
+                bool dir_changed = false;
 
-        switch (key) {
-            case Key::UP:
-                if (cursor_pos > 0) {
-                    cursor_pos--;
-                    need_render = true;
+                char *ptr = inotify_buf;
+                while (ptr < inotify_buf + len) {
+                    auto *event = reinterpret_cast<struct inotify_event *>(ptr);
+                    if (event->mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)) {
+                        need_refresh = true;
+                    }
+                    if ((event->mask & IN_CREATE) && (event->mask & IN_ISDIR)) {
+                        dir_changed = true;
+                    }
+                    if ((event->mask & IN_DELETE_SELF) || (event->mask & IN_MOVED_FROM)) {
+                        need_refresh = true;
+                        dir_changed = true;
+                    }
+                    ptr += sizeof(struct inotify_event) + event->len;
                 }
-                break;
 
-            case Key::DOWN:
-                if (cursor_pos < (int)all_nodes.size() - 1) {
-                    cursor_pos++;
-                    need_render = true;
-                }
-                break;
+                if (need_refresh) {
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_refresh).count();
+                    if (elapsed >= 200) {
+                        last_refresh = now;
 
-            case Key::SPACE: {
-                if (cursor_pos >= 0 && cursor_pos < (int)all_nodes.size()) {
-                    auto &node = all_nodes[cursor_pos];
-
-                    if (node.is_dir) {
-                        // 如果指定了 cd 窗格，智能中断后 cd 到该目录
-                        if (!cd_pane_id.empty()) {
-                            tmux_smart_interrupt(cd_pane_id);
-                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                            std::string dirpath = node.path.string();
-                            tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                        // 如果目录结构变了，重新添加监控
+                        if (dir_changed) {
+                            for (auto &w : watches) {
+                                inotify_rm_watch(inotify_fd, w.wd);
+                            }
+                            watches.clear();
+                            add_watch_recursive(inotify_fd, root_path, watches, show_hidden);
                         }
 
-                        // 无论是否指定 cd 窗格，文件树都要展开/折叠
-                        bool was_expanded = node.expanded;
-                        node.expanded = !was_expanded;
+                        // 保存当前展开状态
+                        std::unordered_map<std::string, bool> expanded_state;
+                        for (const auto &node : all_nodes) {
+                            if (node.is_dir) {
+                                expanded_state[node.path.string()] = node.expanded;
+                            }
+                        }
 
-                        if (node.expanded) {
-                            // 展开：插入子节点
-                            std::vector<fs::directory_entry> entries;
-                            try {
-                                for (auto &entry : fs::directory_iterator(node.path)) {
-                                    if (!show_hidden && is_hidden(entry.path())) continue;
-                                    entries.push_back(entry);
+                        // 重建树节点列表
+                        all_nodes.clear();
+                        std::vector<fs::directory_entry> entries;
+                        try {
+                            for (auto &entry : fs::directory_iterator(root_path)) {
+                                if (!show_hidden && is_hidden(entry.path())) continue;
+                                entries.push_back(entry);
+                            }
+                        } catch (const fs::filesystem_error &) {}
+
+                        std::sort(entries.begin(), entries.end(),
+                                  [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                      bool a_is_dir = a.is_directory();
+                                      bool b_is_dir = b.is_directory();
+                                      if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                      return a.path().filename().string() < b.path().filename().string();
+                                  });
+
+                        for (auto &entry : entries) {
+                            all_nodes.emplace_back(entry, 0);
+                        }
+
+                        // 恢复展开状态
+                        for (auto &node : all_nodes) {
+                            if (node.is_dir) {
+                                auto it = expanded_state.find(node.path.string());
+                                if (it != expanded_state.end() && it->second) {
+                                    // 重新展开该目录
+                                    node.expanded = true;
+                                    std::vector<fs::directory_entry> child_entries;
+                                    try {
+                                        for (auto &child : fs::directory_iterator(node.path)) {
+                                            if (!show_hidden && is_hidden(child.path())) continue;
+                                            child_entries.push_back(child);
+                                        }
+                                    } catch (const fs::filesystem_error &) {}
+                                    std::sort(child_entries.begin(), child_entries.end(),
+                                              [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                                  bool a_is_dir = a.is_directory();
+                                                  bool b_is_dir = b.is_directory();
+                                                  if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                                  return a.path().filename().string() < b.path().filename().string();
+                                              });
+                                    // 找到这个节点在 all_nodes 中的位置
+                                    auto node_it = std::find_if(all_nodes.begin(), all_nodes.end(),
+                                        [&node](const TreeNode &n) { return n.path == node.path; });
+                                    if (node_it != all_nodes.end()) {
+                                        int pos = std::distance(all_nodes.begin(), node_it);
+                                        std::vector<TreeNode> children;
+                                        for (auto &child : child_entries) {
+                                            children.emplace_back(child, node.depth + 1);
+                                        }
+                                        all_nodes.insert(all_nodes.begin() + pos + 1,
+                                                         children.begin(), children.end());
+                                    }
                                 }
-                            } catch (const fs::filesystem_error &) {}
-
-                            std::sort(entries.begin(), entries.end(),
-                                      [](const fs::directory_entry &a, const fs::directory_entry &b) {
-                                          bool a_is_dir = a.is_directory();
-                                          bool b_is_dir = b.is_directory();
-                                          if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
-                                          return a.path().filename().string() < b.path().filename().string();
-                                      });
-
-                            std::vector<TreeNode> children;
-                            for (auto &entry : entries) {
-                                children.emplace_back(entry, node.depth + 1);
-                            }
-
-                            // 在当前节点后面插入子节点
-                            all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
-                                             children.begin(), children.end());
-
-                            if (!cd_pane_id.empty()) {
-                                status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
-                            } else {
-                                status_msg = fmt::format("展开目录: {}", node.display_name);
-                            }
-                        } else {
-                            // 折叠：移除子节点
-                            int remove_count = 0;
-                            int start_remove = cursor_pos + 1;
-                            for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
-                                if (all_nodes[i].depth <= node.depth) break;
-                                remove_count++;
-                            }
-                            if (remove_count > 0) {
-                                all_nodes.erase(all_nodes.begin() + start_remove,
-                                                all_nodes.begin() + start_remove + remove_count);
-                            }
-                            if (!cd_pane_id.empty()) {
-                                status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
-                            } else {
-                                status_msg = fmt::format("折叠目录: {}", node.display_name);
                             }
                         }
-                        need_render = true;
-                    } else {
-                        // 文件操作
-                        status_msg = handle_space_action(node, pane_id, cd_pane_id);
+
+                        // 修正光标位置
+                        if (cursor_pos >= (int)all_nodes.size()) {
+                            cursor_pos = (int)all_nodes.size() - 1;
+                        }
+                        if (cursor_pos < 0) cursor_pos = 0;
+
+                        status_msg = "🔄 文件变动已刷新";
                         need_render = true;
                     }
                 }
-                break;
+            }
+        }
+
+        // 检查键盘输入
+        if (poll_ret > 0 && (pfds[0].revents & POLLIN)) {
+            if (need_render) {
+                render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                need_render = false;
+                status_msg.clear();
             }
 
-            case Key::Q:
-            case Key::ESC:
-                g_running = false;
-                break;
+            Key key = read_key();
 
-            default:
-                break;
+            switch (key) {
+                case Key::UP:
+                    if (cursor_pos > 0) {
+                        cursor_pos--;
+                        need_render = true;
+                    }
+                    break;
+
+                case Key::DOWN:
+                    if (cursor_pos < (int)all_nodes.size() - 1) {
+                        cursor_pos++;
+                        need_render = true;
+                    }
+                    break;
+
+                case Key::SPACE: {
+                    if (cursor_pos >= 0 && cursor_pos < (int)all_nodes.size()) {
+                        auto &node = all_nodes[cursor_pos];
+
+                        if (node.is_dir) {
+                            // 如果指定了 cd 窗格，智能中断后 cd 到该目录
+                            if (!cd_pane_id.empty()) {
+                                tmux_smart_interrupt(cd_pane_id);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                                std::string dirpath = node.path.string();
+                                tmux_send_keys(cd_pane_id, fmt::format("cd '{}'", dirpath));
+                            }
+
+                            // 无论是否指定 cd 窗格，文件树都要展开/折叠
+                            bool was_expanded = node.expanded;
+                            node.expanded = !was_expanded;
+
+                            if (node.expanded) {
+                                // 展开：插入子节点
+                                std::vector<fs::directory_entry> entries;
+                                try {
+                                    for (auto &entry : fs::directory_iterator(node.path)) {
+                                        if (!show_hidden && is_hidden(entry.path())) continue;
+                                        entries.push_back(entry);
+                                    }
+                                } catch (const fs::filesystem_error &) {}
+
+                                std::sort(entries.begin(), entries.end(),
+                                          [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                              bool a_is_dir = a.is_directory();
+                                              bool b_is_dir = b.is_directory();
+                                              if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                              return a.path().filename().string() < b.path().filename().string();
+                                          });
+
+                                std::vector<TreeNode> children;
+                                for (auto &entry : entries) {
+                                    children.emplace_back(entry, node.depth + 1);
+                                }
+
+                                // 在当前节点后面插入子节点
+                                all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
+                                                 children.begin(), children.end());
+
+                                if (!cd_pane_id.empty()) {
+                                    status_msg = fmt::format("展开 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                } else {
+                                    status_msg = fmt::format("展开目录: {}", node.display_name);
+                                }
+                            } else {
+                                // 折叠：移除子节点
+                                int remove_count = 0;
+                                int start_remove = cursor_pos + 1;
+                                for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
+                                    if (all_nodes[i].depth <= node.depth) break;
+                                    remove_count++;
+                                }
+                                if (remove_count > 0) {
+                                    all_nodes.erase(all_nodes.begin() + start_remove,
+                                                    all_nodes.begin() + start_remove + remove_count);
+                                }
+                                if (!cd_pane_id.empty()) {
+                                    status_msg = fmt::format("折叠 + 在窗格 {} 中 cd: {}", cd_pane_id, node.display_name);
+                                } else {
+                                    status_msg = fmt::format("折叠目录: {}", node.display_name);
+                                }
+                            }
+                            need_render = true;
+                        } else {
+                            // 文件操作
+                            status_msg = handle_space_action(node, pane_id, cd_pane_id);
+                            need_render = true;
+                        }
+                    }
+                    break;
+                }
+
+                case Key::Q:
+                case Key::ESC:
+                    g_running = false;
+                    break;
+
+                default:
+                    break;
+            }
+        } else if (poll_ret == 0) {
+            // 超时：没有按键也没有文件变动，但如果有待渲染的内容则渲染
+            if (need_render) {
+                render_interactive(all_nodes, cursor_pos, root_path, pane_id, cd_pane_id, status_msg, scroll_offset);
+                need_render = false;
+                status_msg.clear();
+            }
         }
+    }
+
+    // 清理 inotify
+    if (inotify_fd >= 0) {
+        for (auto &w : watches) {
+            inotify_rm_watch(inotify_fd, w.wd);
+        }
+        close(inotify_fd);
     }
 
     // 恢复终端
@@ -868,37 +1062,7 @@ void print_full_tree(const fs::path &root_path, bool recursive, bool show_hidden
 }
 
 //============================================================================
-// inotify 监控 - 递归添加所有子目录
-//============================================================================
-
-struct WatchDir {
-    int wd;
-    fs::path path;
-};
-
-void add_watch_recursive(int inotify_fd, const fs::path &dir,
-                         std::vector<WatchDir> &watches, bool show_hidden) {
-    // 添加当前目录
-    int wd = inotify_add_watch(inotify_fd, dir.c_str(),
-                               IN_CREATE | IN_DELETE | IN_MODIFY |
-                               IN_MOVED_FROM | IN_MOVED_TO |
-                               IN_ATTRIB | IN_DELETE_SELF);
-    if (wd >= 0) {
-        watches.push_back({wd, dir});
-    }
-
-    // 递归添加子目录
-    std::error_code ec;
-    for (auto &entry : fs::directory_iterator(dir, ec)) {
-        if (entry.is_directory()) {
-            if (!show_hidden && is_hidden(entry.path())) continue;
-            add_watch_recursive(inotify_fd, entry.path(), watches, show_hidden);
-        }
-    }
-}
-
-//============================================================================
-// 监控循环
+// inotify 监控循环（非交互模式使用）
 //============================================================================
 
 void watch_loop(const fs::path &root_path, bool recursive, bool show_hidden) {
@@ -1048,7 +1212,8 @@ int main(int argc, char *argv[]) {
             fmt::print("  ↑/↓        移动光标\n");
             fmt::print("  Space      目录:展开/折叠（若指定 -c 则同时在 cd 窗格中 cd 到该目录）\n");
             fmt::print("             文件:在 tmux 窗格中打开（若窗格正在运行程序则先中断）\n");
-            fmt::print("  q/ESC      退出交互模式\n\n");
+            fmt::print("  q/ESC      退出交互模式\n");
+            fmt::print(style::watch_color, "  💡 交互模式自动监听文件变动，有变化时自动刷新\n\n");
             fmt::print(style::title_color, "示例:\n");
             fmt::print("  listtree\n");
             fmt::print("  listtree -r ~/code\n");
