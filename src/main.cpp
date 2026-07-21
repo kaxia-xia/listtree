@@ -1,6 +1,7 @@
 //============================================================================
-// listtree - 在终端中美观地显示目录树结构（支持实时监控）
+// listtree - 在终端中美观地显示目录树结构（支持实时监控 + 交互模式）
 // 用法: listtree [目录路径] [-r|--recursive] [-a|--all] [-w|--watch]
+//        listtree -i [-p pane_id] [目录路径]  # 交互模式
 //============================================================================
 
 #include <algorithm>
@@ -18,6 +19,8 @@
 #include <poll.h>
 #include <sys/inotify.h>
 #include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 #include <fmt/core.h>
 #include <fmt/color.h>
@@ -42,6 +45,7 @@ inline constexpr auto line_color    = fmt::fg(fmt::color::steel_blue);
 inline constexpr auto title_color   = fmt::fg(fmt::color::hot_pink) | fmt::emphasis::bold;
 inline constexpr auto watch_color   = fmt::fg(fmt::color::green_yellow) | fmt::emphasis::bold;
 inline constexpr auto change_color  = fmt::fg(fmt::color::aqua);
+inline constexpr auto info_color    = fmt::fg(fmt::color::yellow);
 
 } // namespace style
 
@@ -131,8 +135,476 @@ std::string_view file_icon(const fs::directory_entry &entry) {
     return "  ";
 }
 
+// Check if file is a document type (text/code) that can be opened with micro
+bool is_document_file(const fs::path &p) {
+    auto ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    const std::vector<std::string> doc_exts = {
+        ".txt", ".md", ".markdown", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx",
+        ".py", ".java", ".rs", ".go", ".js", ".ts", ".mjs", ".html", ".htm",
+        ".css", ".scss", ".less", ".json", ".xml", ".yaml", ".yml",
+        ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash", ".zsh",
+        ".vim", ".vimrc", ".dockerfile", ".cmake", ".mk", ".sql",
+        ".csv", ".log", ".env", ".gitignore", ".gitattributes",
+        ".gitmodules", ".editorconfig", ".svg", ".tex", ".bib",
+        ".lua", ".pl", ".pm", ".rb", ".php", ".swift", ".kt", ".scala",
+        ".clj", ".cljs", ".elm", ".hs", ".ml", ".mli", ".erl", ".hrl",
+        ".ex", ".exs", ".tsx", ".jsx", ".vue", ".svelte", ".astro",
+        ".makefile", "makefile", ".dockerfile"
+    };
+    return std::find(doc_exts.begin(), doc_exts.end(), ext) != doc_exts.end() ||
+           std::find(doc_exts.begin(), doc_exts.end(), p.filename().string()) != doc_exts.end();
+}
+
+// Check if file is an archive
+bool is_archive_file(const fs::path &p) {
+    auto ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    const std::vector<std::string> archive_exts = {
+        ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+        ".tgz", ".tbz2", ".txz", ".tar.gz", ".tar.bz2", ".tar.xz"
+    };
+    return std::find(archive_exts.begin(), archive_exts.end(), ext) != archive_exts.end();
+}
 //============================================================================
-// 树形打印核心逻辑
+// 树形数据结构 - 用于交互模式
+//============================================================================
+
+struct TreeNode {
+    fs::path path;
+    std::string display_name;
+    std::string icon_str;
+    bool is_dir;
+    bool is_sym;
+    bool is_hid;
+    bool is_exec;
+    bool expanded = false;      // 是否展开（仅目录有效）
+    int depth = 0;              // 缩进层级
+    uintmax_t fsize = 0;
+    std::string size_str;
+    std::string time_str;
+    TreeNode() = default;
+
+    TreeNode(const fs::directory_entry &entry, int depth_level)
+        : path(entry.path())
+        , display_name(entry.path().filename().string())
+        , icon_str(file_icon(entry))
+        , is_dir(entry.is_directory())
+        , is_sym(entry.is_symlink())
+        , is_hid(is_hidden(entry.path()))
+        , is_exec(is_executable(entry))
+        , depth(depth_level)
+    {
+        if (entry.is_regular_file()) {
+            std::error_code ec;
+            fsize = entry.file_size(ec);
+            if (!ec) size_str = format_size(fsize);
+        }
+        try {
+            auto ftime = entry.last_write_time();
+            time_str = format_time(ftime);
+        } catch (...) {}
+    }
+};
+
+//============================================================================
+// 获取终端大小
+//============================================================================
+
+struct TermSize {
+    int rows = 24;
+    int cols = 80;
+};
+
+TermSize get_term_size() {
+    TermSize ts;
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        ts.rows = ws.ws_row;
+        ts.cols = ws.ws_col;
+    }
+    return ts;
+}
+//============================================================================
+// 终端原始模式（用于捕获按键）
+//============================================================================
+
+struct termios orig_termios;
+
+void enable_raw_mode() {
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1; // 100ms timeout
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+void disable_raw_mode() {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+}
+
+//============================================================================
+// 读取按键（支持方向键等转义序列）
+//============================================================================
+
+enum class Key {
+    UP, DOWN, LEFT, RIGHT,
+    SPACE, ENTER, ESC, Q,
+    UNKNOWN
+};
+
+Key read_key() {
+    char c;
+    if (read(STDIN_FILENO, &c, 1) != 1) return Key::UNKNOWN;
+
+    if (c == '\033') {
+        char seq[2];
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) return Key::ESC;
+        if (seq[0] == '[') {
+            if (read(STDIN_FILENO, &seq[1], 1) != 1) return Key::UNKNOWN;
+            switch (seq[1]) {
+                case 'A': return Key::UP;
+                case 'B': return Key::DOWN;
+                case 'C': return Key::RIGHT;
+                case 'D': return Key::LEFT;
+                default: return Key::UNKNOWN;
+            }
+        }
+        return Key::UNKNOWN;
+    }
+
+    if (c == ' ') return Key::SPACE;
+    if (c == '\n' || c == '\r') return Key::ENTER;
+    if (c == 'q' || c == 'Q') return Key::Q;
+    if (c == 27) return Key::ESC;
+
+    return Key::UNKNOWN;
+}
+
+//============================================================================
+// 渲染完整交互界面
+//============================================================================
+
+void render_interactive(const std::vector<TreeNode> &nodes, int cursor_pos,
+                        const fs::path &root_path, const std::string &pane_id,
+                        const std::string &status_msg) {
+    auto ts = get_term_size();
+
+    // 清屏
+    fmt::print("\033[2J\033[H");
+
+    // 标题行
+    fmt::print(style::title_color, "  📂 交互模式: ");
+    fmt::print(fg(fmt::color::white) | fmt::emphasis::bold, "{}", root_path.string());
+    if (!pane_id.empty()) {
+        fmt::print(style::info_color, "  [tmux: {}]", pane_id);
+    }
+    fmt::print("\n");
+
+    // 分隔线
+    fmt::print(style::line_color, "  ");
+    for (int i = 0; i < std::min(ts.cols - 2, 60); ++i) fmt::print("─");
+    fmt::print("\n");
+
+    // 计算可见行数（减去标题、分隔线、底部提示）
+    int available_rows = ts.rows - 5;
+    if (available_rows <= 0) available_rows = 10;
+
+    // 计算滚动偏移
+    int scroll_offset = 0;
+    if (cursor_pos >= available_rows) {
+        scroll_offset = cursor_pos - available_rows + 1;
+    }
+    if (cursor_pos < scroll_offset) {
+        scroll_offset = cursor_pos;
+    }
+
+    // 渲染可见节点
+    int start_idx = scroll_offset;
+    int end_idx = std::min(start_idx + available_rows, (int)nodes.size());
+
+    for (int i = start_idx; i < end_idx; ++i) {
+        const auto &node = nodes[i];
+        bool is_cursor = (i == cursor_pos);
+
+        std::string indent;
+        for (int d = 0; d < node.depth; ++d) {
+            indent += "│   ";
+        }
+
+        std::string line;
+        line += indent;
+        line += "├── ";
+        line += node.icon_str + " ";
+
+        std::string name_part = node.display_name;
+        if (node.is_dir && node.expanded) {
+            name_part = "▼ " + name_part;
+        }
+
+        line += name_part;
+
+        if (!node.size_str.empty() || !node.time_str.empty()) {
+            line += " ·";
+            if (!node.size_str.empty()) { line += " " + node.size_str; }
+            if (!node.time_str.empty()) { line += " " + node.time_str; }
+        }
+
+        if (is_cursor) {
+            fmt::print("\033[7m{}\033[0m\n", line);
+        } else {
+            fmt::print("{}\n", line);
+        }
+    }
+
+    // 底部状态栏
+    fmt::print(style::line_color, "  ");
+    for (int i = 0; i < std::min(ts.cols - 2, 60); ++i) fmt::print("─");
+    fmt::print("\n");
+
+    if (!status_msg.empty()) {
+        fmt::print(style::info_color, "  {}\n", status_msg);
+    } else {
+        fmt::print(style::watch_color,
+            "  ↑↓ 移动  Space:展开/打开  q:退出  ({} / {})\n",
+            cursor_pos + 1, nodes.size());
+    }
+}
+//============================================================================
+// 在指定 tmux 窗格中执行命令
+//============================================================================
+
+void tmux_send_keys(const std::string &pane_id, const std::string &cmd) {
+    if (pane_id.empty()) return;
+    std::string escaped_cmd = cmd;
+    // 转义单引号
+    size_t pos = 0;
+    while ((pos = escaped_cmd.find('\'', pos)) != std::string::npos) {
+        escaped_cmd.replace(pos, 1, "'\\''");
+        pos += 4;
+    }
+    std::string full_cmd = fmt::format("tmux send-keys -t '{}' '{}' Enter", pane_id, escaped_cmd);
+    std::system(full_cmd.c_str());
+}
+
+//============================================================================
+// 处理空格键操作
+//============================================================================
+
+std::string handle_space_action(TreeNode &node, const std::string &pane_id) {
+    if (node.is_dir) {
+        // 切换展开/折叠
+        node.expanded = !node.expanded;
+        if (node.expanded) {
+            return fmt::format("展开目录: {}", node.display_name);
+        } else {
+            return fmt::format("折叠目录: {}", node.display_name);
+        }
+    } else if (node.is_sym) {
+        return "符号链接，跳过";
+    } else {
+        // 文件操作
+        std::string filepath = node.path.string();
+
+        if (is_document_file(node.path)) {
+            // 文档文件 - 用 micro 打开
+            if (!pane_id.empty()) {
+                tmux_send_keys(pane_id, fmt::format("micro '{}'", filepath));
+                return fmt::format("在 tmux 窗格中用 micro 打开: {}", node.display_name);
+            } else {
+                return fmt::format("未指定 tmux 窗格，无法打开文件: {}", node.display_name);
+            }
+        } else if (is_archive_file(node.path)) {
+            // 压缩包 - 显示内容
+            if (!pane_id.empty()) {
+                tmux_send_keys(pane_id, fmt::format("echo '=== {} 内容 ==='", node.display_name));
+                // 根据扩展名选择命令
+                auto ext = node.path.extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".zip") {
+                    tmux_send_keys(pane_id, fmt::format("unzip -l '{}' | head -50", filepath));
+                } else if (ext == ".rar") {
+                    tmux_send_keys(pane_id, fmt::format("unrar l '{}' | head -50", filepath));
+                } else if (ext == ".7z") {
+                    tmux_send_keys(pane_id, fmt::format("7z l '{}' | head -50", filepath));
+                } else {
+                    // tar.gz, tar.bz2, tar.xz, tgz, etc.
+                    tmux_send_keys(pane_id, fmt::format("tar tf '{}' | head -50", filepath));
+                }
+                return fmt::format("显示压缩包内容: {}", node.display_name);
+            } else {
+                return fmt::format("未指定 tmux 窗格，无法显示压缩包: {}", node.display_name);
+            }
+        } else if (node.is_exec) {
+            // 可执行文件 - 直接执行
+            if (!pane_id.empty()) {
+                tmux_send_keys(pane_id, fmt::format("'{}'", filepath));
+                return fmt::format("执行: {}", node.display_name);
+            } else {
+                return fmt::format("未指定 tmux 窗格，无法执行: {}", node.display_name);
+            }
+        } else {
+            return fmt::format("未知文件类型，跳过: {}", node.display_name);
+        }
+    }
+}
+
+//============================================================================
+// 交互模式主循环
+//============================================================================
+
+void interactive_mode(const fs::path &root_path, bool show_hidden,
+                      const std::string &pane_id) {
+    // 构建树节点列表
+    std::vector<TreeNode> all_nodes;
+    // 初始构建（仅根目录下一级）
+    {
+        std::vector<fs::directory_entry> entries;
+        try {
+            for (auto &entry : fs::directory_iterator(root_path)) {
+                if (!show_hidden && is_hidden(entry.path())) continue;
+                entries.push_back(entry);
+            }
+        } catch (const fs::filesystem_error &) {}
+
+        std::sort(entries.begin(), entries.end(),
+                  [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                      bool a_is_dir = a.is_directory();
+                      bool b_is_dir = b.is_directory();
+                      if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                      return a.path().filename().string() < b.path().filename().string();
+                  });
+
+        for (auto &entry : entries) {
+            all_nodes.emplace_back(entry, 0);
+        }
+    }
+
+    int cursor_pos = 0;
+    std::string status_msg;
+    bool need_render = true;
+
+    // 设置终端为原始模式
+    enable_raw_mode();
+
+    // 隐藏光标
+    fmt::print("\033[?25l");
+
+    // 注册信号恢复终端
+    signal(SIGINT, [](int) {
+        disable_raw_mode();
+        fmt::print("\033[?25h\033[2J\033[H");
+        exit(0);
+    });
+    signal(SIGTERM, [](int) {
+        disable_raw_mode();
+        fmt::print("\033[?25h\033[2J\033[H");
+        exit(0);
+    });
+
+    while (g_running) {
+        if (need_render) {
+            render_interactive(all_nodes, cursor_pos, root_path, pane_id, status_msg);
+            need_render = false;
+            status_msg.clear();
+        }
+
+        Key key = read_key();
+
+        switch (key) {
+            case Key::UP:
+                if (cursor_pos > 0) {
+                    cursor_pos--;
+                    need_render = true;
+                }
+                break;
+
+            case Key::DOWN:
+                if (cursor_pos < (int)all_nodes.size() - 1) {
+                    cursor_pos++;
+                    need_render = true;
+                }
+                break;
+
+            case Key::SPACE: {
+                if (cursor_pos >= 0 && cursor_pos < (int)all_nodes.size()) {
+                    auto &node = all_nodes[cursor_pos];
+
+                    if (node.is_dir) {
+                        // 切换展开/折叠
+                        bool was_expanded = node.expanded;
+                        node.expanded = !was_expanded;
+
+                        if (node.expanded) {
+                            // 展开：插入子节点
+                            std::vector<fs::directory_entry> entries;
+                            try {
+                                for (auto &entry : fs::directory_iterator(node.path)) {
+                                    if (!show_hidden && is_hidden(entry.path())) continue;
+                                    entries.push_back(entry);
+                                }
+                            } catch (const fs::filesystem_error &) {}
+
+                            std::sort(entries.begin(), entries.end(),
+                                      [](const fs::directory_entry &a, const fs::directory_entry &b) {
+                                          bool a_is_dir = a.is_directory();
+                                          bool b_is_dir = b.is_directory();
+                                          if (a_is_dir != b_is_dir) return a_is_dir > b_is_dir;
+                                          return a.path().filename().string() < b.path().filename().string();
+                                      });
+
+                            std::vector<TreeNode> children;
+                            for (auto &entry : entries) {
+                                children.emplace_back(entry, node.depth + 1);
+                            }
+
+                            // 在当前节点后面插入子节点
+                            all_nodes.insert(all_nodes.begin() + cursor_pos + 1,
+                                             children.begin(), children.end());
+
+                            status_msg = fmt::format("展开目录: {}", node.display_name);
+                        } else {
+                            // 折叠：移除子节点
+                            int remove_count = 0;
+                            int start_remove = cursor_pos + 1;
+                            for (int i = start_remove; i < (int)all_nodes.size(); ++i) {
+                                if (all_nodes[i].depth <= node.depth) break;
+                                remove_count++;
+                            }
+                            if (remove_count > 0) {
+                                all_nodes.erase(all_nodes.begin() + start_remove,
+                                                all_nodes.begin() + start_remove + remove_count);
+                            }
+                            status_msg = fmt::format("折叠目录: {}", node.display_name);
+                        }
+                        need_render = true;
+                    } else {
+                        // 文件操作
+                        status_msg = handle_space_action(node, pane_id);
+                        need_render = true;
+                    }
+                }
+                break;
+            }
+
+            case Key::Q:
+            case Key::ESC:
+                g_running = false;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    // 恢复终端
+    disable_raw_mode();
+    fmt::print("\033[?25h\033[2J\033[H");
+    fmt::print(style::watch_color, "  👋 交互模式已退出\n");
+}
+//============================================================================
+// 树形打印核心逻辑（非交互模式 - 保留原有功能）
 //============================================================================
 
 struct TreeStats {
@@ -412,6 +884,8 @@ int main(int argc, char *argv[]) {
     bool recursive = false;
     bool show_hidden = false;
     bool watch_mode = false;
+    bool interactive = false;
+    std::string pane_id;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -421,6 +895,15 @@ int main(int argc, char *argv[]) {
             show_hidden = true;
         } else if (arg == "-w" || arg == "--watch") {
             watch_mode = true;
+        } else if (arg == "-i" || arg == "--interactive") {
+            interactive = true;
+        } else if (arg == "-p" || arg == "--pane") {
+            if (i + 1 < argc) {
+                pane_id = argv[++i];
+            } else {
+                fmt::print(stderr, style::error_color, "❌ 错误: -p/--pane 需要指定 tmux 窗格 ID\n");
+                return 1;
+            }
         } else if (arg == "-h" || arg == "--help") {
             fmt::print(style::title_color, "listtree v2.0.0 - 实时目录树查看器\n");
             fmt::print("在终端中美观地显示目录树结构，支持实时监控文件变动\n\n");
@@ -430,13 +913,22 @@ int main(int argc, char *argv[]) {
             fmt::print("  -r, --recursive    递归显示子目录\n");
             fmt::print("  -a, --all          显示隐藏文件\n");
             fmt::print("  -w, --watch        实时监控模式，文件变动自动刷新\n");
+            fmt::print("  -i, --interactive  交互模式，支持方向键导航和空格操作\n");
+            fmt::print("  -p, --pane ID      指定 tmux 窗格 ID（用于交互模式打开文件）\n");
             fmt::print("  -h, --help         显示此帮助信息\n\n");
+            fmt::print(style::title_color, "交互模式操作:\n");
+            fmt::print("  ↑/↓        移动光标\n");
+            fmt::print("  Space      目录:展开/折叠一级  文件:在 tmux 窗格中打开\n");
+            fmt::print("  q/ESC      退出交互模式\n\n");
             fmt::print(style::title_color, "示例:\n");
             fmt::print("  listtree\n");
             fmt::print("  listtree -r ~/code\n");
             fmt::print("  listtree -r -a .\n");
             fmt::print("  listtree -w -r .          # 实时监控当前目录\n");
-            fmt::print("  listtree -w -r -a /path   # 实时监控（含隐藏文件）\n\n");
+            fmt::print("  listtree -w -r -a /path   # 实时监控（含隐藏文件）\n");
+            fmt::print("  listtree -i               # 交互模式\n");
+            fmt::print("  listtree -i -p 0          # 交互模式，tmux 窗格 0\n");
+            fmt::print("  listtree -i -p mypane:1   # 交互模式，指定 tmux 窗格\n\n");
             fmt::print(style::watch_color, "💡 提示: 按 Ctrl+C 退出监控模式\n");
             return 0;
         } else {
@@ -456,7 +948,12 @@ int main(int argc, char *argv[]) {
 
     root_path = fs::absolute(root_path);
 
-    if (watch_mode) {
+    if (interactive) {
+        // 交互模式
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+        interactive_mode(root_path, show_hidden, pane_id);
+    } else if (watch_mode) {
         // 实时监控模式
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
