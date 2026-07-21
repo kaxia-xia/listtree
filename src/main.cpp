@@ -886,7 +886,6 @@ int main(int argc, char *argv[]) {
     bool watch_mode = false;
     bool interactive = false;
     std::string pane_id;
-
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-r" || arg == "--recursive") {
