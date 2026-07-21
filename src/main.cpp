@@ -848,47 +848,32 @@ void interactive_mode(const fs::path &root_path, bool show_hidden,
                 int mouse_row = g_last_mouse_click.row;
                 g_last_mouse_debug_row = mouse_row;
 
-                // 布局: 行1=标题, 行2=分隔线, 行3起=节点
+                // 计算可见节点数
                 auto ts = get_term_size();
                 int available_rows = ts.rows - 5;
                 if (available_rows <= 0) available_rows = 10;
                 int visible_count = std::min(available_rows, (int)all_nodes.size() - scroll_offset);
                 if (visible_count < 0) visible_count = 0;
 
-                // 节点占据的行范围（1-based）
-                int node_start_row = 3;
-                int node_end_row = 2 + visible_count;
+                // 通过调试得知：在 Termux 中，第一个节点（index=0）在鼠标行号 5
+                // 布局: 行1-2=Termux标题栏, 行3=我们的标题, 行4=分隔线, 行5起=节点
+                // 所以映射公式: clicked_idx = scroll_offset + (mouse_row - 5)
+                int first_node_row = 5;
+                int last_node_row = first_node_row + visible_count - 1;
 
                 int clicked_idx = -1;
 
-                // 尝试 1: 标准 1-based，节点从第3行开始
-                if (mouse_row >= node_start_row && mouse_row <= node_end_row) {
-                    clicked_idx = scroll_offset + (mouse_row - node_start_row);
+                // 尝试 1: 第一个节点在第5行
+                if (mouse_row >= first_node_row && mouse_row <= last_node_row) {
+                    clicked_idx = scroll_offset + (mouse_row - first_node_row);
                 }
 
-                // 尝试 2: 如果鼠标行号是 0-based（某些终端），转成 1-based
+                // 尝试 2: 如果第一个节点在第4行（无 Termux 标题栏的情况）
                 if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
-                    int row_1based = mouse_row + 1;
-                    if (row_1based >= node_start_row && row_1based <= node_end_row) {
-                        clicked_idx = scroll_offset + (row_1based - node_start_row);
-                    }
-                }
-
-                // 尝试 3: 整体偏移 -1
-                if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
-                    int adjusted_start = node_start_row - 1;
-                    int adjusted_end = node_end_row - 1;
-                    if (mouse_row >= adjusted_start && mouse_row <= adjusted_end) {
-                        clicked_idx = scroll_offset + (mouse_row - adjusted_start);
-                    }
-                }
-
-                // 尝试 4: 整体偏移 +1
-                if (clicked_idx < 0 || clicked_idx >= (int)all_nodes.size()) {
-                    int adjusted_start = node_start_row + 1;
-                    int adjusted_end = node_end_row + 1;
-                    if (mouse_row >= adjusted_start && mouse_row <= adjusted_end) {
-                        clicked_idx = scroll_offset + (mouse_row - adjusted_start);
+                    int alt_first = 3;
+                    int alt_last = alt_first + visible_count - 1;
+                    if (mouse_row >= alt_first && mouse_row <= alt_last) {
+                        clicked_idx = scroll_offset + (mouse_row - alt_first);
                     }
                 }
 
