@@ -101,39 +101,122 @@ std::string_view file_icon(const fs::directory_entry &entry) {
     auto ext = entry.path().extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
-    if (ext == ".cpp" || ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".cc" || ext == ".cxx") return "🅲";
-    if (ext == ".py") return "🐍";
-    if (ext == ".java") return "☕";
-    if (ext == ".rs") return "🦀";
+    // C/C++/C#
+    if (ext == ".c" || ext == ".h") return "🅲";
+    if (ext == ".cpp" || ext == ".hpp" || ext == ".cc" || ext == ".cxx" || ext == ".hh" || ext == ".hxx") return "🅲";
+    if (ext == ".cs" || ext == ".csx") return "#️⃣";
+    // Python
+    if (ext == ".py" || ext == ".pyw" || ext == ".pyx" || ext == ".pxd" || ext == ".pxi") return "🐍";
+    // Java
+    if (ext == ".java" || ext == ".class" || ext == ".jar" || ext == ".jmod") return "☕";
+    // Rust
+    if (ext == ".rs" || ext == ".rlib") return "🦀";
+    // Go
     if (ext == ".go") return "🔵";
-    if (ext == ".js" || ext == ".ts" || ext == ".mjs") return "🟨";
+    // JavaScript / TypeScript
+    if (ext == ".js" || ext == ".mjs" || ext == ".cjs") return "🟨";
+    if (ext == ".ts" || ext == ".tsx") return "🔷";
+    if (ext == ".jsx") return "⚛️";
+    // Web / XAML / UI
     if (ext == ".html" || ext == ".htm") return "🌐";
-    if (ext == ".css" || ext == ".scss" || ext == ".less") return "🎨";
+    if (ext == ".css" || ext == ".scss" || ext == ".less" || ext == ".sass") return "🎨";
+    if (ext == ".vue") return "💚";
+    if (ext == ".svelte") return "🧡";
+    if (ext == ".astro") return "🪐";
+    if (ext == ".xaml") return "🪟";
+    // Data / Config
     if (ext == ".json") return "📋";
     if (ext == ".xml") return "📄";
     if (ext == ".yaml" || ext == ".yml") return "⚙️";
+    if (ext == ".toml") return "🔩";
+    if (ext == ".ini" || ext == ".cfg" || ext == ".conf" || ext == ".config") return "⚙️";
+    // Documentation
     if (ext == ".md" || ext == ".markdown") return "📝";
     if (ext == ".txt") return "📃";
+    if (ext == ".tex" || ext == ".bib") return "📐";
+    if (ext == ".rst") return "📜";
+    if (ext == ".pdf") return "📕";
+    // Images
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".webp") return "🖼️";
     if (ext == ".svg") return "✏️";
-    if (ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".ogg") return "🎵";
-    if (ext == ".mp4" || ext == ".avi" || ext == ".mkv" || ext == ".mov") return "🎬";
-    if (ext == ".zip" || ext == ".tar" || ext == ".gz" || ext == ".bz2" || ext == ".7z" || ext == ".rar") return "📦";
-    if (ext == ".pdf") return "📕";
-    if (ext == ".sh" || ext == ".bash" || ext == ".zsh") return "⚡";
+    if (ext == ".ico") return "🖼️";
+    // Audio
+    if (ext == ".mp3" || ext == ".wav" || ext == ".flac" || ext == ".ogg" || ext == ".m4a" || ext == ".aac") return "🎵";
+    // Video
+    if (ext == ".mp4" || ext == ".avi" || ext == ".mkv" || ext == ".mov" || ext == ".webm" || ext == ".flv") return "🎬";
+    // Archives
+    if (ext == ".zip" || ext == ".tar" || ext == ".gz" || ext == ".bz2" || ext == ".xz" || ext == ".7z" || ext == ".rar") return "📦";
+    if (ext == ".tgz" || ext == ".tbz2") return "📦";
+    // Shell / Scripts
+    if (ext == ".sh" || ext == ".bash" || ext == ".zsh" || ext == ".fish") return "⚡";
+    if (ext == ".bat" || ext == ".cmd" || ext == ".ps1") return "🪟";
+    if (ext == ".lua") return "🌙";
+    if (ext == ".pl" || ext == ".pm") return "🐪";
+    if (ext == ".rb") return "💎";
+    if (ext == ".php" || ext == ".phtml") return "🐘";
+    // Swift / Kotlin / Scala
+    if (ext == ".swift") return "🐦";
+    if (ext == ".kt" || ext == ".kts") return "🅺";
+    if (ext == ".scala" || ext == ".sc") return "🔥";
+    // Functional
+    if (ext == ".hs" || ext == ".lhs") return "λ";
+    if (ext == ".ml" || ext == ".mli") return "🏰";
+    if (ext == ".clj" || ext == ".cljs" || ext == ".cljc" || ext == ".edn") return "🌿";
+    if (ext == ".elm") return "🌳";
+    if (ext == ".erl" || ext == ".hrl") return "📞";
+    if (ext == ".ex" || ext == ".exs") return "💜";
+    // Other languages
+    if (ext == ".dart") return "🎯";
+    if (ext == ".r" || ext == ".rdata" || ext == ".rds") return "📊";
+    if (ext == ".m" || ext == ".mat") return "📐";  // MATLAB / Objective-C
+    if (ext == ".mm") return "🍎";  // Objective-C++
+    if (ext == ".f" || ext == ".f90" || ext == ".f95" || ext == ".f03" || ext == ".f08") return "🔢";  // Fortran
+    if (ext == ".jl") return "🟣";  // Julia
+    if (ext == ".zig") return "⚡";
+    if (ext == ".nim") return "💛";
+    if (ext == ".cr") return "🔴";  // Crystal
+    if (ext == ".v") return "💜";  // V
+    if (ext == ".odin") return "🔘";
+    if (ext == ".grace") return "🕊️";
+    // Build / Make
+    if (ext == ".cmake" || ext == ".cmake.in") return "📐";
+    if (ext == ".mk" || ext == ".makefile" || ext == "makefile" || ext == "gnumakefile") return "🔨";
+    if (ext == ".dockerfile" || ext == "dockerfile") return "🐳";
+    // Libraries / Binaries
     if (ext == ".so" || ext == ".dll" || ext == ".dylib") return "🔧";
     if (ext == ".o" || ext == ".obj") return "🧱";
-    if (ext == ".exe" || ext == ".out") return "▶️";
-    if (ext == ".toml") return "🔩";
+    if (ext == ".exe" || ext == ".out" || ext == ".app") return "▶️";
+    if (ext == ".a" || ext == ".lib" || ext == ".la") return "📦";
+    // Version control
     if (ext == ".lock") return "🔒";
-    if (ext == ".gitignore" || ext == ".gitattributes" || ext == ".gitmodules") return "🙈";
-    if (ext == ".env") return "🔐";
-    if (ext == ".config" || ext == ".conf" || ext == ".ini") return "⚙️";
+    if (ext == ".gitignore" || ext == ".gitattributes" || ext == ".gitmodules" || ext == ".gitkeep") return "🙈";
+    // Environment
+    if (ext == ".env" || ext == ".env.example" || ext == ".env.local") return "🔐";
+    // Logs / Data
     if (ext == ".log") return "📋";
     if (ext == ".csv") return "📊";
-    if (ext == ".sql" || ext == ".db" || ext == ".sqlite") return "🗄️";
+    if (ext == ".tsv") return "📊";
+    // Database
+    if (ext == ".sql" || ext == ".db" || ext == ".sqlite" || ext == ".sqlite3") return "🗄️";
+    // Editor / IDE
     if (ext == ".vim" || ext == ".vimrc") return "✏️";
-    if (ext == ".dockerfile" || ext == "dockerfile") return "🐳";
+    if (ext == ".editorconfig") return "⚙️";
+    if (ext == ".vscode" || ext == ".code-workspace") return "💻";
+    // Config files by name
+    auto fname = entry.path().filename().string();
+    std::transform(fname.begin(), fname.end(), fname.begin(), ::tolower);
+    if (fname == "dockerfile") return "🐳";
+    if (fname == "makefile" || fname == "gnumakefile") return "🔨";
+    if (fname == "cmakelists.txt") return "📐";
+    if (fname == "procfile") return "📋";
+    if (fname == "gemfile" || fname == "gemfile.lock") return "💎";
+    if (fname == "podfile" || fname == "podfile.lock") return "🍎";
+    if (fname == "cargofile" || fname == "cargo.toml" || fname == "cargo.lock") return "🦀";
+    if (fname == "package.json" || fname == "package-lock.json") return "📦";
+    if (fname == "tsconfig.json" || fname == "jsconfig.json") return "⚙️";
+    if (fname == "webpack.config.js" || fname == "vite.config.js" || fname == "vite.config.ts") return "🔨";
+    if (fname == "docker-compose.yml" || fname == "docker-compose.yaml") return "🐳";
+    if (fname == ".gitignore" || fname == ".gitattributes" || fname == ".gitmodules") return "🙈";
     if (is_executable(entry)) return "▶️";
     return "  ";
 }
@@ -143,17 +226,66 @@ bool is_document_file(const fs::path &p) {
     auto ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     const std::vector<std::string> doc_exts = {
-        ".txt", ".md", ".markdown", ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx",
-        ".py", ".java", ".rs", ".go", ".js", ".ts", ".mjs", ".html", ".htm",
-        ".css", ".scss", ".less", ".json", ".xml", ".yaml", ".yml",
-        ".toml", ".ini", ".cfg", ".conf", ".sh", ".bash", ".zsh",
-        ".vim", ".vimrc", ".dockerfile", ".cmake", ".mk", ".sql",
-        ".csv", ".log", ".env", ".gitignore", ".gitattributes",
-        ".gitmodules", ".editorconfig", ".svg", ".tex", ".bib",
-        ".lua", ".pl", ".pm", ".rb", ".php", ".swift", ".kt", ".scala",
-        ".clj", ".cljs", ".elm", ".hs", ".ml", ".mli", ".erl", ".hrl",
-        ".ex", ".exs", ".tsx", ".jsx", ".vue", ".svelte", ".astro",
-        ".makefile", "makefile", ".dockerfile"
+        // Plain text / documentation
+        ".txt", ".md", ".markdown", ".rst", ".tex", ".bib", ".nfo",
+        // C / C++ / C#
+        ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh", ".hxx",
+        ".cs", ".csx",
+        // Python
+        ".py", ".pyw", ".pyx", ".pxd", ".pxi",
+        // Java
+        ".java", ".jsp",
+        // Rust
+        ".rs", ".rlib",
+        // Go
+        ".go",
+        // JavaScript / TypeScript
+        ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
+        // Web / XAML
+        ".html", ".htm", ".css", ".scss", ".less", ".sass",
+        ".vue", ".svelte", ".astro",
+        ".xaml",
+        // Data / Config
+        ".json", ".xml", ".yaml", ".yml", ".toml",
+        ".ini", ".cfg", ".conf", ".config",
+        ".csv", ".tsv",
+        // Shell / Scripts
+        ".sh", ".bash", ".zsh", ".fish",
+        ".bat", ".cmd", ".ps1",
+        ".lua", ".pl", ".pm", ".rb", ".php", ".phtml",
+        // Swift / Kotlin / Scala
+        ".swift", ".kt", ".kts", ".scala", ".sc",
+        // Functional
+        ".hs", ".lhs", ".ml", ".mli",
+        ".clj", ".cljs", ".cljc", ".edn",
+        ".elm", ".erl", ".hrl", ".ex", ".exs",
+        // Other languages
+        ".dart", ".r", ".rdata", ".rds",
+        ".m", ".mm", ".mat",
+        ".f", ".f90", ".f95", ".f03", ".f08",
+        ".jl", ".zig", ".nim", ".cr", ".v", ".odin",
+        // Build / Make / CI
+        ".cmake", ".cmake.in", ".mk", ".makefile",
+        ".dockerfile",
+        ".gradle", ".groovy",
+        // Database
+        ".sql",
+        // Editor / IDE
+        ".vim", ".vimrc", ".editorconfig",
+        ".vscode", ".code-workspace",
+        // Logs
+        ".log",
+        // Environment
+        ".env", ".env.example", ".env.local",
+        // Version control
+        ".gitignore", ".gitattributes", ".gitmodules", ".gitkeep",
+        // Other text formats
+        ".svg", ".tex", ".bib", ".nfo", ".dtd", ".xsl", ".xslt",
+        ".proto", ".graphql", ".gql",
+        ".terraform", ".tf", ".tfvars",
+        ".dockerignore",
+        // Assembly
+        ".asm", ".s", ".inc"
     };
     return std::find(doc_exts.begin(), doc_exts.end(), ext) != doc_exts.end() ||
            std::find(doc_exts.begin(), doc_exts.end(), p.filename().string()) != doc_exts.end();
@@ -671,7 +803,15 @@ std::string handle_space_action(TreeNode &node, const std::vector<std::string> &
                 return fmt::format("未指定 tmux 窗格，无法执行: {}", node.display_name);
             }
         } else {
-            return fmt::format("未知文件类型，跳过: {}", node.display_name);
+            // 未知文件类型 - 尝试用 micro 打开（可能是文本文件但扩展名未被识别）
+            if (!pane_ids.empty()) {
+                tmux_smart_interrupt(pane_ids);
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                tmux_send_keys(pane_ids, fmt::format("micro '{}'", filepath));
+                return fmt::format("在 tmux 窗格中用 micro 打开: {}", node.display_name);
+            } else {
+                return fmt::format("未指定 tmux 窗格，无法打开文件: {}", node.display_name);
+            }
         }
     }
 }
